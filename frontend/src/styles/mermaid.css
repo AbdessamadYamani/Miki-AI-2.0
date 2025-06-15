@@ -1,0 +1,86 @@
+.mermaid-diagram {
+  background-color: #1a1a1a;
+  border-radius: 0.5rem;
+  padding: 1rem;
+  overflow: auto;
+}
+
+.mermaid-diagram svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Dark theme overrides for Mermaid */
+.mermaid-diagram .node rect,
+.mermaid-diagram .node circle,
+.mermaid-diagram .node ellipse,
+.mermaid-diagram .node polygon,
+.mermaid-diagram .node path {
+  fill: #2d3748 !important;
+  stroke: #4a5568 !important;
+}
+
+.mermaid-diagram .edgePath .path {
+  stroke: #4a5568 !important;
+}
+
+.mermaid-diagram .edgeLabel {
+  background-color: #2d3748 !important;
+  color: #e2e8f0 !important;
+}
+
+.mermaid-diagram .label {
+  color: #e2e8f0 !important;
+}
+
+.mermaid-diagram .cluster rect {
+  fill: #1a202c !important;
+  stroke: #4a5568 !important;
+}
+
+/* Sequence diagram specific styles */
+.mermaid-diagram .actor {
+  fill: #2d3748 !important;
+  stroke: #4a5568 !important;
+}
+
+.mermaid-diagram text.actor {
+  fill: #e2e8f0 !important;
+}
+
+.mermaid-diagram .messageLine0,
+.mermaid-diagram .messageLine1 {
+  stroke: #4a5568 !important;
+}
+
+.mermaid-diagram .note {
+  fill: #2d3748 !important;
+  stroke: #4a5568 !important;
+}
+
+.mermaid-diagram .noteText {
+  fill: #e2e8f0 !important;
+}
+
+/* Hide Mermaid syntax errors globally */
+.mermaid-error-text,
+.mermaid-error,
+.mermaid[data-processed="true"] {
+  display: none !important;
+}
+
+/* Hide any elements containing "Syntax error in text" */
+*:has-text("Syntax error in text") {
+  display: none !important;
+}
+
+/* Alternative approach using attribute selectors */
+[class*="mermaid-error"] {
+  display: none !important;
+}
+
+/* Hide error elements that might be created by Mermaid */
+.mermaid + .error,
+.mermaid-container .error {
+  display: none !important;
+} 
