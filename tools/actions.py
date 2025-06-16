@@ -4,7 +4,7 @@ import logging,re
 import google.generativeai as genai
 from PIL import  Image
 from tools.token_usage_tool import _get_token_usage
-from vision.vis import image_to_base64,_hash_pil_image,capture_full_screen
+from vision.vis import image_to_base64,_hash_pil_image,capture_full_screen,locate_and_click_ui_element
 from agents.ai_agent import UIAgent
 from tools.web_search_tool import search_web_for_info
 import time
@@ -520,16 +520,9 @@ def execute_action(action: dict, agent: 'UIAgent') -> Union[Tuple[bool, str], Tu
             elif action_type == "click":
                 desc = parameters.get("element_description")
                 if not desc: return False, "Action 'click' failed: Missing 'element_description'.", None
-                # locate_and_click_ui_element calls agent.select_ui_element_for_click which returns tokens.
-                # These tokens need to be passed up.
-                click_success, click_message_and_tokens = locate_and_click_ui_element(desc, agent) # type: ignore
-                click_message = click_message_and_tokens
-                click_tokens = action_token_usage # Default
-                if isinstance(click_message_and_tokens, tuple) and len(click_message_and_tokens) == 2:
-                    click_message, click_tokens = click_message_and_tokens # type: ignore
-
-                return click_success, click_message, {"type": "click_result", "token_usage": click_tokens}
-
+                # locate_and_click_ui_element returns (success, message)
+                click_success, click_message = locate_and_click_ui_element(desc, agent)
+                return click_success, click_message, {"type": "click_result", "token_usage": action_token_usage}
 
             elif action_type == "type":
                 text = parameters.get("text_to_type")
@@ -716,15 +709,11 @@ def execute_action(action: dict, agent: 'UIAgent') -> Union[Tuple[bool, str], Tu
                 if text is None: return False, "Action 'click_and_type' failed: Missing 'text_to_type'.", None
                 logging.info(f"[click_and_type] Performing click on: '{desc}'")
 
-                click_success, click_message_and_tokens = locate_and_click_ui_element(desc, agent) # type: ignore
-                click_message = click_message_and_tokens
-                click_tokens = action_token_usage # Default
-                if isinstance(click_message_and_tokens, tuple) and len(click_message_and_tokens) == 2:
-                    click_message, click_tokens = click_message_and_tokens # type: ignore
+                click_success, click_message = locate_and_click_ui_element(desc, agent)
 
                 if not click_success:
                     logging.error(f"[click_and_type] Click part failed: {click_message}")
-                    return False, f"Action 'click_and_type' failed during click: {click_message}", {"type": "click_failed", "token_usage": click_tokens}
+                    return False, f"Action 'click_and_type' failed during click: {click_message}", {"type": "click_failed", "token_usage": action_token_usage}
                 logging.info(f"[click_and_type] Click successful, now typing.")
                 try:
                     interval_f = float(interval) # type: ignore
@@ -732,11 +721,11 @@ def execute_action(action: dict, agent: 'UIAgent') -> Union[Tuple[bool, str], Tu
                     time.sleep(0.3)
                     pyautogui.typewrite(text, interval=interval_f) # type: ignore
                     log_text = (text[:50] + '...') if len(text) > 53 else text # type: ignore
-                    return True, f"Clicked '{desc}' and typed text: '{log_text}'", {"type": "click_and_type_success", "token_usage": click_tokens}
+                    return True, f"Clicked '{desc}' and typed text: '{log_text}'", {"type": "click_and_type_success", "token_usage": action_token_usage}
                 except ValueError:
-                    return False, f"Action 'click_and_type' failed during type: Invalid 'interval_seconds': {interval}.", {"type": "type_failed", "token_usage": click_tokens}
+                    return False, f"Action 'click_and_type' failed during type: Invalid 'interval_seconds': {interval}.", {"type": "type_failed", "token_usage": action_token_usage}
                 except Exception as e:
-                    return False, f"Action 'click_and_type' failed during type: {e}", {"type": "type_failed", "token_usage": click_tokens}
+                    return False, f"Action 'click_and_type' failed during type: {e}", {"type": "type_failed", "token_usage": action_token_usage}
 
             elif action_type == "describe_screen":
                 logging.info("Capturing screen to describe...")

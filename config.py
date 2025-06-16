@@ -161,30 +161,73 @@ logging.basicConfig(level=logging.DEBUG,
 
 # Initialize ChromaDB
 try:
+    # First, ensure the directory exists
+    os.makedirs(CHROMA_DATA_PATH, exist_ok=True)
+    
+    # Try to initialize the client
     chroma_client = chromadb.PersistentClient(path=CHROMA_DATA_PATH)
     default_ef = embedding_functions.DefaultEmbeddingFunction()
 
-    task_executions_collection = chroma_client.get_or_create_collection(
-        name="task_executions",
-        embedding_function=default_ef,
-        metadata={"hnsw:space": "cosine"} # Optional: specify distance metric
-    )
-    reinforcements_collection = chroma_client.get_or_create_collection(
-        name="reinforcements",
-        embedding_function=default_ef,
-        metadata={"hnsw:space": "cosine"}
-    )
-    user_task_structures_collection = chroma_client.get_or_create_collection(
-        name="user_task_structures",
-        embedding_function=default_ef,
-        metadata={"hnsw:space": "cosine"}
-    )
-    logging.info(f"ChromaDB initialized. Collections 'task_executions', 'reinforcements', and 'user_task_structures' ready.")
-    logging.info(f"ChromaDB data path: {CHROMA_DATA_PATH}")
-    logging.info(f"Task executions collection count: {task_executions_collection.count()}")
-    logging.info(f"Reinforcements collection count: {reinforcements_collection.count()}")
-    logging.info(f"User task structures collection count: {user_task_structures_collection.count()}")
-    print(f"{GREEN}[OK] ChromaDB initialized successfully.{RESET}")
+    # Function to safely get or create a collection
+    def get_or_create_collection(name):
+        try:
+            return chroma_client.get_or_create_collection(
+                name=name,
+                embedding_function=default_ef,
+                metadata={"hnsw:space": "cosine"}
+            )
+        except Exception as e:
+            logging.error(f"Error getting/creating collection '{name}': {e}")
+            # If there's an error, try to delete and recreate the collection
+            try:
+                chroma_client.delete_collection(name)
+                return chroma_client.create_collection(
+                    name=name,
+                    embedding_function=default_ef,
+                    metadata={"hnsw:space": "cosine"}
+                )
+            except Exception as recreate_e:
+                logging.error(f"Failed to recreate collection '{name}': {recreate_e}")
+                raise
+
+    # Initialize collections with error handling
+    try:
+        task_executions_collection = get_or_create_collection("task_executions")
+        reinforcements_collection = get_or_create_collection("reinforcements")
+        user_task_structures_collection = get_or_create_collection("user_task_structures")
+        
+        # Verify collections are working
+        task_executions_collection.count()
+        reinforcements_collection.count()
+        user_task_structures_collection.count()
+        
+        logging.info(f"ChromaDB initialized. Collections 'task_executions', 'reinforcements', and 'user_task_structures' ready.")
+        logging.info(f"ChromaDB data path: {CHROMA_DATA_PATH}")
+        logging.info(f"Task executions collection count: {task_executions_collection.count()}")
+        logging.info(f"Reinforcements collection count: {reinforcements_collection.count()}")
+        logging.info(f"User task structures collection count: {user_task_structures_collection.count()}")
+        print(f"{GREEN}[OK] ChromaDB initialized successfully.{RESET}")
+    except Exception as e:
+        logging.error(f"Error initializing collections: {e}")
+        # If collection initialization fails, try to reset the database
+        try:
+            logging.info("Attempting to reset ChromaDB...")
+            # Delete the database directory
+            import shutil
+            shutil.rmtree(CHROMA_DATA_PATH)
+            os.makedirs(CHROMA_DATA_PATH, exist_ok=True)
+            
+            # Recreate client and collections
+            chroma_client = chromadb.PersistentClient(path=CHROMA_DATA_PATH)
+            task_executions_collection = get_or_create_collection("task_executions")
+            reinforcements_collection = get_or_create_collection("reinforcements")
+            user_task_structures_collection = get_or_create_collection("user_task_structures")
+            
+            logging.info("ChromaDB reset successful")
+            print(f"{GREEN}[OK] ChromaDB reset and reinitialized successfully.{RESET}")
+        except Exception as reset_e:
+            logging.error(f"Failed to reset ChromaDB: {reset_e}")
+            raise
 
 except Exception as e:
     logging.error(f"FATAL: Failed to initialize ChromaDB client or collections: {e}", exc_info=True)

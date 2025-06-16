@@ -185,18 +185,33 @@ def find_similar_user_task_structure(query_instruction: str, n_results: int = 1)
         return None
     if not query_instruction: return None
     try:
-        count = user_task_structures_collection.count()
+        # First check if the collection exists and has any data
+        try:
+            count = user_task_structures_collection.count()
+        except Exception as count_error:
+            logging.error(f"Error checking collection count: {count_error}")
+            print(f"{BLUE}[ChromaDB] Database appears to be uninitialized or corrupted. Please initialize the database first.{RESET}")
+            return None
+
         if count == 0:
             logging.info("No user task structures in DB to search.")
             return None
 
         # Query using the instruction. The document content is the task name.
         # We are searching for task names similar to the user's instruction.
-        results = user_task_structures_collection.query(
-            query_texts=[query_instruction],
-            n_results=min(n_results, count), # Ensure n_results <= collection count
-            include=['metadatas', 'distances'] # Include distances. IDs are typically returned by default.
-        )
+        try:
+            results = user_task_structures_collection.query(
+                query_texts=[query_instruction],
+                n_results=min(n_results, count), # Ensure n_results <= collection count
+                include=['metadatas', 'distances'] # Include distances. IDs are typically returned by default.
+            )
+        except Exception as query_error:
+            if "Nothing found on disk" in str(query_error):
+                logging.error("ChromaDB database files not found. Database may need to be reinitialized.")
+                print(f"{BLUE}[ChromaDB] Database files not found. Please reinitialize the database.{RESET}")
+            else:
+                logging.error(f"Error querying ChromaDB: {query_error}")
+            return None
 
         if results and results['ids'] and results['ids'][0] and results['distances'] and results['distances'][0]:
             # ChromaDB returns lists of lists for these, even for n_results=1

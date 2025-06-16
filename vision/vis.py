@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Optional
+from typing import Optional, Tuple
 import numpy as np
 import cv2
 from PIL import Image, ImageGrab
@@ -68,7 +68,7 @@ def locate_and_click_ui_element(element_desc: str, agent: UIAgent) -> Tuple[bool
     )
 
 
-    matching_idx = agent.select_ui_element_for_click(
+    matching_idx, token_usage = agent.select_ui_element_for_click(
         ui_elements, element_desc, cv2_screenshot, vis_img
     )
 
