@@ -76,14 +76,16 @@ def get_application_shortcuts(app_name_base: str) -> Tuple[str, Dict[str, int]]:
     """
     token_usage = {"prompt_tokens": 0, "candidates_tokens": 0, "total_tokens": 0}
     try:
-        response = client.models.generate_content( # type: ignore
-            model=MODEL_NAME, # type: ignore
+        client= get_client() 
+        response = client.models.generate_content( 
+            model=MODEL_NAME, 
             contents=[{"text": prompt}], 
-            config=GenerateContentConfig( # type: ignore
-                tools=[GOOGLE_SEARCH_TOOL], # type: ignore
-                response_modalities=["TEXT"], # type: ignore
+            config=GenerateContentConfig( 
+                tools=[GOOGLE_SEARCH_TOOL], 
+                response_modalities=["TEXT"], 
             )
         )
+        print("Shortcut done")
         token_usage = _get_token_usage(response)
 
         raw_response_text = ""
@@ -129,9 +131,9 @@ def get_application_shortcuts(app_name_base: str) -> Tuple[str, Dict[str, int]]:
             shortcuts_cache[app_name_base] = "" 
             return "", token_usage
 
-    except google_exceptions.GoogleAPIError as api_err: # type: ignore
+    except google_exceptions.GoogleAPIError as api_err: 
         logging.error(f"Google API Error fetching shortcuts: {api_err}", exc_info=True)
-        return "", {"prompt_tokens": 0, "candidates_tokens": 0, "total_tokens": 0} # type: ignore
+        return "", {"prompt_tokens": 0, "candidates_tokens": 0, "total_tokens": 0} 
     except Exception as e:
         logging.error(f"Unexpected error fetching shortcuts with LLM Client: {e}", exc_info=True)
-        return "", {"prompt_tokens": 0, "candidates_tokens": 0, "total_tokens": 0} # type: ignore
+        return "", {"prompt_tokens": 0, "candidates_tokens": 0, "total_tokens": 0} 
