@@ -74,7 +74,7 @@ def assess_action_outcome(
             files = exec_message.get('files', [])
             
             # Format the message in a structured way
-            message = "📄 File Processing Results\n"
+            message = "File Processing Results\n"
             message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             
             if source == "local":
@@ -87,7 +87,7 @@ def assess_action_outcome(
                     message += f"🔗 URL: {url}\n"
                     
             message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            message += f"📝 Analysis:\n{result}\n"
+            message += f"Analysis:\n{result}\n"
             message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             
             return "SUCCESS", message, token_usage
