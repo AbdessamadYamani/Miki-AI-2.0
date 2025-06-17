@@ -15,60 +15,102 @@ from config import get_model
 
 
 def process_user_instruction(instruction: str, conversation_history: List[str]) -> Tuple[Optional[dict], Dict[str, int]]:
-    """
-    Process user instruction and break it down into sub-tasks if needed.
-    Returns a plan with sub-tasks and their execution order.
-    """
-    prompt = f"""You are an AI task planner. Your job is to break down complex tasks into sub-tasks and create a detailed execution plan.
+    """Process a user instruction and return a plan."""
+    try:
+        # Get the current model instance
+        llm_model = get_model()
+        if llm_model is None:
+            logging.error("LLM model is None in process_user_instruction")
+            return None, {"prompt_tokens": 0, "candidates_tokens": 0, "total_tokens": 0}
 
-User Instruction: {instruction}
+        # Check if the instruction contains a file reference
+        has_file = False
+        file_path = None
+        file_url = None
+        prompt = None
+        
+        # Look for file information in the instruction
+        if "file:" in instruction.lower():
+            # Split on "file:" and take everything after it
+            parts = instruction.split("file:", 1)[1].strip()
+            # Split on first space to separate file path from prompt
+            file_parts = parts.split(" ", 1)
+            file_path = file_parts[0].strip()
+            prompt = file_parts[1].strip() if len(file_parts) > 1 else "Please analyze this file."
+            has_file = True
+        elif "url:" in instruction.lower():
+            url_parts = instruction.split("url:", 1)[1].strip().split(" ", 1)
+            file_url = url_parts[0].strip()
+            prompt = url_parts[1].strip() if len(url_parts) > 1 else "Please analyze this file."
+            has_file = True
+        else:
+            # Look for files referenced with backticks
+            file_matches = re.findall(r'`([^`]+)`', instruction)
+            if file_matches:
+                file_path = file_matches[0]  # Take the first file found
+                # Extract prompt from the instruction, excluding the file reference
+                prompt = instruction.replace(f"`{file_path}`", "").strip()
+                if not prompt:
+                    prompt = "Please analyze this file."
+                has_file = True
 
-Conversation History:
-{chr(10).join(conversation_history) if conversation_history else "No previous conversation."}
+        # Create the planning prompt
+        prompt = f"""
+You are an AI assistant planning actions to help the user. Your task is to create a plan of actions to accomplish the user's goal.
 
-First, analyze if this is a complex task that needs to be broken down into sub-tasks.
-If it is complex, break it down into logical sub-tasks.
-For each sub-task, create a detailed plan of actions.
+User's instruction: {instruction}
 
-Example of a complex task breakdown:
-Task: "Open YouTube and search for the latest song of Zara Larsson then play it"
-Sub-tasks:
-1. Open YouTube
-   - Focus on browser window
-   - Navigate to youtube.com
-2. Search for Zara Larsson
-   - Click search bar
-   - Type search query
-   - Press enter
-3. Play the first video
-   - Wait for search results
-   - Click first video
-   - Verify video starts playing
+{'(A file has been provided for processing)' if has_file else ''}
+
+Available actions:
+1. process_local_files: Process a local file with a prompt (Use this for single local files)
+   - Parameters: file_path, prompt
+2. process_files_from_urls: Process a file from a URL with a prompt
+   - Parameters: url, prompt
+3. search_web: Search the web for information
+   - Parameters: query
+4. navigate_web: Navigate to a specific URL
+   - Parameters: url
+5. click: Click on a UI element
+   - Parameters: element_description
+6. type: Type text
+   - Parameters: text_to_type
+7. press_keys: Press keyboard keys
+   - Parameters: keys
+8. move_mouse: Move mouse to coordinates
+   - Parameters: x, y, duration_seconds
+9. wait: Wait for specified duration
+   - Parameters: duration_seconds
+10. describe_screen: Get description of current screen
+11. capture_screenshot: Capture screenshot
+    - Parameters: file_path (optional)
+12. write_file: Write content to a file
+    - Parameters: file_path, content, append (optional)
+13. read_file: Read content from a file
+    - Parameters: file_path
+14. run_shell_command: Execute a shell command
+    - Parameters: command, working_directory (optional)
+15. run_python_script: Run a Python script
+    - Parameters: script_path, working_directory (optional)
+16. search_youtube: Search YouTube videos and analyze transcripts
+    - Parameters: query
+17. generate_large_content_with_gemini: Generate content using Gemini
+    - Parameters: context_summary, detailed_prompt_for_gemini, target_file_path
+18. INFORM_USER: Send a message to the user
+    - Parameters: message
+19. task_complete: Signal task completion
+
+{'(If a file is provided, start with processing that file before any other actions.)' if has_file else ''}
+
+Create a plan that:
+1. Uses the most appropriate actions
+2. Handles errors gracefully
+3. Provides clear feedback
+4. Accomplishes the user's goal efficiently
 
 Return your plan as a JSON object with this structure:
 {{
-    "is_complex_task": true/false,
-    "sub_tasks": [
-        {{
-            "description": "Sub-task description",
-            "actions": [
-                {{
-                    "action_type": "action_name",
-                    "parameters": {{
-                        "param1": "value1",
-                        "param2": "value2"
-                    }}
-                }}
-            ]
-        }}
-    ],
-    "reasoning": "Explanation of why this breakdown was chosen"
-}}
-
-If the task is simple (doesn't need sub-tasks), return:
-{{
-    "is_complex_task": false,
-    "actions": [
+    "plan": [
         {{
             "action_type": "action_name",
             "parameters": {{
@@ -76,51 +118,50 @@ If the task is simple (doesn't need sub-tasks), return:
                 "param2": "value2"
             }}
         }}
-    ],
-    "reasoning": "Explanation of why this is a simple task"
+    ]
 }}
 """
 
-    # Generate the plan using the model instance
-    response = llm_model.generate_content(prompt)
-    token_usage = _get_token_usage(response)
-    
-    if not response.candidates or not response.candidates[0].content:
-        return None, token_usage
+        # Generate the plan using the model instance
+        response = llm_model.generate_content(prompt)
+        token_usage = _get_token_usage(response)
         
-    plan_text = "".join(part.text for part in response.candidates[0].content.parts if hasattr(part, 'text'))
-    
-    try:
-        plan_dict = json.loads(plan_text)
-        
-        # Validate the plan structure
-        if not isinstance(plan_dict, dict):
-            raise ValueError("Plan must be a dictionary")
+        if not response.candidates or not response.candidates[0].content:
+            return None, token_usage
             
-        if "is_complex_task" not in plan_dict:
-            raise ValueError("Plan must specify if it's a complex task")
-            
-        if plan_dict["is_complex_task"]:
-            if "sub_tasks" not in plan_dict:
-                raise ValueError("Complex task must have sub_tasks")
-            for sub_task in plan_dict["sub_tasks"]:
-                if "description" not in sub_task or "actions" not in sub_task:
-                    raise ValueError("Each sub-task must have description and actions")
-        else:
-            if "actions" not in plan_dict:
-                raise ValueError("Simple task must have actions")
-                
-        return plan_dict, token_usage
+        plan_text = "".join(part.text for part in response.candidates[0].content.parts if hasattr(part, 'text'))
         
-    except json.JSONDecodeError as e:
-        logging.error(f"Failed to parse plan JSON: {e}")
-        return None, token_usage
-    except ValueError as e:
-        logging.error(f"Invalid plan structure: {e}")
-        return None, token_usage
+        try:
+            plan = json.loads(plan_text)
+            
+            # If a file is provided, ensure the first action is file processing
+            if has_file and plan.get("plan"):
+                first_action = plan["plan"][0]
+                if file_path and first_action.get("action_type") != "process_local_files":
+                    plan["plan"].insert(0, {
+                        "action_type": "process_local_files",
+                        "parameters": {
+                            "file_path": file_path,
+                            "prompt": prompt
+                        }
+                    })
+                elif file_url and first_action.get("action_type") != "process_files_from_urls":
+                    plan["plan"].insert(0, {
+                        "action_type": "process_files_from_urls",
+                        "parameters": {
+                            "url": [file_url],
+                            "prompt": prompt
+                        }
+                    })
+            
+            return plan, token_usage
+        except json.JSONDecodeError as e:
+            logging.error(f"Failed to parse plan JSON: {e}")
+            return None, token_usage
+            
     except Exception as e:
-        logging.error(f"Unexpected error processing plan: {e}")
-        return None, token_usage
+        logging.error(f"Error in process_user_instruction: {e}", exc_info=True)
+        return None, {"prompt_tokens": 0, "candidates_tokens": 0, "total_tokens": 0}
 
 
 
