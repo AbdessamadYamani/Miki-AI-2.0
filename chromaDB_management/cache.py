@@ -70,8 +70,10 @@ def get_active_window_name() -> str:
 class UICache:
     def __init__(self):
         self.cache = {}
+        self.hot_path_cache = {}  # Cache for frequently accessed elements
         self.last_screenshot_hash = None
         self.last_app_name = None
+        self.window_info = {}  # Store window dimensions and positions
         self.load_cache()
 
     def load_cache(self):
@@ -232,59 +234,103 @@ class UICache:
 
         return ui_elements
 
+    def _hash_image(self, image: np.ndarray) -> str:
+        """Generate a hash for the image"""
+        return hashlib.md5(image.tobytes()).hexdigest()
+
+    def _get_relative_position(self, element_center: Tuple[int, int], window_rect: Tuple[int, int, int, int]) -> Tuple[float, float]:
+        """Convert absolute screen coordinates to relative window coordinates"""
+        x, y = element_center
+        win_x, win_y, win_w, win_h = window_rect
+        rel_x = (x - win_x) / win_w
+        rel_y = (y - win_y) / win_h
+        return (rel_x, rel_y)
+
+    def _get_absolute_position(self, rel_pos: Tuple[float, float], window_rect: Tuple[int, int, int, int]) -> Tuple[int, int]:
+        """Convert relative window coordinates back to absolute screen coordinates"""
+        rel_x, rel_y = rel_pos
+        win_x, win_y, win_w, win_h = window_rect
+        abs_x = int(win_x + rel_x * win_w)
+        abs_y = int(win_y + rel_y * win_h)
+        return (abs_x, abs_y)
+
+    def update_hot_path(self, app_name: str, element_desc: str, element: UIElement, window_rect: Tuple[int, int, int, int]):
+        """Update the hot path cache with frequently accessed elements"""
+        if app_name not in self.hot_path_cache:
+            self.hot_path_cache[app_name] = {}
+        
+        rel_pos = self._get_relative_position(element.center, window_rect)
+        self.hot_path_cache[app_name][element_desc] = {
+            'relative_position': rel_pos,
+            'element_type': element.element_type,
+            'label': element.label,
+            'last_updated': time.time()
+        }
+        self.save_cache()
+
+    def get_from_hot_path(self, app_name: str, element_desc: str, window_rect: Tuple[int, int, int, int]) -> Optional[Tuple[int, int]]:
+        """Try to get element position from hot path cache"""
+        if app_name not in self.hot_path_cache:
+            return None
+        
+        cached = self.hot_path_cache[app_name].get(element_desc)
+        if not cached:
+            return None
+        
+        # Check if cache is still valid (less than 5 minutes old)
+        if time.time() - cached['last_updated'] > 300:
+            del self.hot_path_cache[app_name][element_desc]
+            return None
+        
+        return self._get_absolute_position(cached['relative_position'], window_rect)
 
     def get_ui_elements(self, screenshot: np.ndarray, app_name: Optional[str] = None) -> UIElementCollection:
         """Get UI elements from cache if screenshot is the same, otherwise detect new ones"""
-
         img_hash = self._hash_image(screenshot)
-
-
         current_app_name = app_name or get_active_window_name()
+        
+        # Update window info
+        try:
+            import win32gui
+            hwnd = win32gui.GetForegroundWindow()
+            rect = win32gui.GetWindowRect(hwnd)
+            self.window_info[current_app_name] = rect
+        except Exception as e:
+            logging.warning(f"Could not update window info: {e}")
 
         self.last_screenshot_hash = img_hash
         self.last_app_name = current_app_name
 
+        # Check hot path cache first
+        if current_app_name in self.hot_path_cache:
+            window_rect = self.window_info.get(current_app_name)
+            if window_rect:
+                return self.get_from_hot_path(current_app_name, "current_element", window_rect)
 
+        # Check regular cache
         cached_data = self.cache.get(current_app_name)
         if cached_data and cached_data.get('screenshot_hash') == img_hash:
             logging.info(f"Using cached UI elements for {current_app_name}")
-
             elements = cached_data.get('ui_elements')
             return elements if isinstance(elements, UIElementCollection) else UIElementCollection()
 
-
-
+        # Detect new elements if not in cache
         logging.info(f"Detecting new UI elements for {current_app_name}")
         try:
             ui_elements = detect_ui_elements_from_image(screenshot)
             if not isinstance(ui_elements, UIElementCollection):
-                 logging.error(f"detect_ui_elements_from_image did not return a UIElementCollection (got {type(ui_elements)}).")
-                 ui_elements = UIElementCollection()
+                logging.error(f"detect_ui_elements_from_image did not return a UIElementCollection (got {type(ui_elements)}).")
+                ui_elements = UIElementCollection()
         except Exception as e:
             logging.error(f"Error detecting UI elements: {e}")
             return UIElementCollection()
 
-
+        # Update cache
         self.cache[current_app_name] = {
             'screenshot_hash': img_hash,
             'ui_elements': ui_elements
         }
-
-
         self.save_cache()
 
         return ui_elements
-
-    def _hash_image(self, image: np.ndarray) -> str:
-        """Generate a hash for the image to check if it has changed"""
-        try:
-
-            small_img = cv2.resize(image, (320, 180), interpolation=cv2.INTER_AREA)
-            return hashlib.md5(small_img.tobytes()).hexdigest()
-        except cv2.error as e:
-             logging.error(f"OpenCV error during image hashing: {e}. Returning random hash.")
-             return hashlib.md5(str(time.time()).encode()).hexdigest()
-        except Exception as e:
-             logging.error(f"Unexpected error during image hashing: {e}. Returning random hash.")
-             return hashlib.md5(str(time.time()).encode()).hexdigest()
 

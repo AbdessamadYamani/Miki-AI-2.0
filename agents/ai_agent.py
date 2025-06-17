@@ -1,4 +1,3 @@
-
 import logging
 import re
 import numpy as np
@@ -24,8 +23,7 @@ class UIAgent:
 
             # Initialize token_usage for this specific LLM call
             llm_call_token_usage = {"prompt_tokens": 0, "candidates_tokens": 0, "total_tokens": 0}
-            self.last_reasoning = "Selection process not started." # type: ignore
-
+            self.last_reasoning = "Selection process not started."
 
             if not elements:
                 logging.warning("No UI elements provided to select_ui_element_for_click.")
@@ -37,11 +35,42 @@ class UIAgent:
                 self.last_reasoning = "Missing screenshot for visual analysis."
                 return None, llm_call_token_usage
 
+            # Try pattern matching first for common cases
+            element_desc_lower = element_desc.lower()
+            
+            # Common button patterns
+            button_patterns = {
+                'ok': ['ok', 'okay', 'confirm', 'done', 'finish'],
+                'cancel': ['cancel', 'close', 'exit', 'back'],
+                'yes': ['yes', 'confirm', 'agree', 'accept'],
+                'no': ['no', 'decline', 'reject', 'deny'],
+                'next': ['next', 'continue', 'proceed', 'forward'],
+                'previous': ['previous', 'back', 'return'],
+                'save': ['save', 'store', 'keep'],
+                'delete': ['delete', 'remove', 'erase', 'clear']
+            }
+
+            # Check for exact matches first
+            for i, elem in enumerate(elements):
+                elem_label_lower = elem.label.lower()
+                
+                # Exact match
+                if element_desc_lower == elem_label_lower:
+                    self.last_reasoning = f"Found exact match for '{element_desc}'"
+                    return i, llm_call_token_usage
+                
+                # Check button patterns
+                for pattern, keywords in button_patterns.items():
+                    if any(keyword in elem_label_lower for keyword in keywords) and pattern in element_desc_lower:
+                        self.last_reasoning = f"Found button pattern match for '{element_desc}'"
+                        return i, llm_call_token_usage
+
+            # If no pattern match found, proceed with AI model
             elements_description = []
             for i, elem in enumerate(elements):
                 label = elem.label.strip() if elem.label else "[No Label]"
                 desc = f"Element {i}: Type='{elem.element_type}', Label='{label[:50]}{'...' if len(label)>50 else ''}', Center=({int(elem.center[0])},{int(elem.center[1])})"
-                elements_description.append(desc) # type: ignore
+                elements_description.append(desc)
 
             if not elements_description:
                 logging.warning("UI elements list was empty after formatting descriptions.")
@@ -93,11 +122,9 @@ class UIAgent:
                 "2. Examine the element list for candidates based on label, type, and location.",
                 "3. If visualization is available, confirm the index using the numbered boxes.",
                 "4. Explain your choice for the best match or state if no clear match exists.",
-                # --- REVERTED OUTPUT FORMAT ---
                 "\nFormat your response ONLY with these two lines:",
                 "REASONING: [Your detailed step-by-step reasoning here]",
                 "SELECTED: [The index number of the best match, or 'NOT FOUND']"
-                # --- END REVERTED OUTPUT FORMAT ---
             ])
 
             prompt_text = "\n".join(prompt_parts)
@@ -106,7 +133,7 @@ class UIAgent:
             try:
                 safety_settings = {}
                 response = self.model.generate_content(content, safety_settings=safety_settings)
-                llm_call_token_usage = _get_token_usage(response) # Capture tokens for this call
+                llm_call_token_usage = _get_token_usage(response)
                 txt = ""
                 if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
                     txt = "".join(part.text for part in response.candidates[0].content.parts if hasattr(part, 'text')).strip()
@@ -116,25 +143,20 @@ class UIAgent:
                         block_reason = response.prompt_feedback.block_reason
                         logging.error(f"LLM response blocked: {block_reason}")
                         self.last_reasoning = f"LLM response blocked ({block_reason})."
-                    else: # type: ignore
+                    else:
                         logging.error("LLM response was empty.")
                         self.last_reasoning = "LLM returned empty response."
                     return None, llm_call_token_usage
 
                 logging.info(f"[UI Agent Raw Response]\n{txt}")
-            except ValueError as ve:
-                logging.error(f"ValueError accessing LLM response: {ve}")
-                self.last_reasoning = f"LLM response likely blocked. ValueError: {ve}"
-                return None, llm_call_token_usage # Return accumulated (likely zero) tokens
             except Exception as e:
                 logging.error(f"Error getting response from Gemini: {e}")
                 self.last_reasoning = f"Error communicating with LLM: {e}"
-                return None, llm_call_token_usage # Return accumulated (likely zero) tokens
+                return None, llm_call_token_usage
 
             reasoning = "No reasoning extracted."
             selection = None
 
-            # --- REVERTED PARSING LOGIC ---
             reasoning_match = re.search(r'REASONING:\s*(.*?)(?=\nSELECTED:|$)', txt, re.DOTALL | re.IGNORECASE)
             selection_match = re.search(r'SELECTED:\s*(\d+|NOT FOUND)', txt, re.IGNORECASE)
 
@@ -167,16 +189,14 @@ class UIAgent:
                     selection = None
             else:
                 logging.warning("Could not extract selection.")
-                # Fallback attempt if keywords are missing but text might contain the index
                 if "NOT FOUND" not in txt.upper():
                     lines = txt.strip().split('\n')
                     last_line = lines[-1] if lines else ""
-                    # Try to find a number at the end of the last line or the whole text
-                    numbers_in_last_line = re.findall(r'\b(\d+)\b$', last_line) # Check end of last line
+                    numbers_in_last_line = re.findall(r'\b(\d+)\b$', last_line)
                     if not numbers_in_last_line:
-                        numbers_in_text = re.findall(r'\b(\d+)\b', txt) # Check anywhere
+                        numbers_in_text = re.findall(r'\b(\d+)\b', txt)
                         if numbers_in_text:
-                            numbers_in_last_line = [numbers_in_text[-1]] # Use the last number found
+                            numbers_in_last_line = [numbers_in_text[-1]]
 
                     if numbers_in_last_line:
                         try:
@@ -188,8 +208,7 @@ class UIAgent:
                             else:
                                 logging.warning(f"Fallback number {potential_idx} out of bounds.")
                         except ValueError:
-                            pass # Ignore if conversion fails
-            # --- END REVERTED PARSING LOGIC ---
+                            pass
 
             self.last_reasoning = reasoning
             logging.info(f"LLM selected element index: {selection}" if selection is not None else "LLM did not select a valid index.")
