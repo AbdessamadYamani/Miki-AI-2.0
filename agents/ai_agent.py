@@ -1,27 +1,25 @@
 import logging
 import re
+from typing import Optional, Tuple, Dict, Union
+import google.generativeai as genai
 import numpy as np
-from typing import List, Dict, Optional, Tuple, Union, Any, Generator
-from tools.token_usage_tool import _get_token_usage
-from vision.xga import detect_ui_elements_from_image, visualize_ui_elements, UIElementCollection, UIElement # type: ignore # type: ignore
-from utils.image_utils import cv2_to_pil, image_to_base64 # type: ignore
-
-
+from utils.image_utils import cv2_to_pil, image_to_base64 # cv2_to_pil is used
+from tools.token_usage_tool import _get_token_usage # Assuming this is in tools
+from vision.xga import UIElementCollection # Assuming this is in vision.xga
 
 class UIAgent:
-    def __init__(self, llm_model):
+    def __init__(self, llm_model: genai.GenerativeModel):
         self.model = llm_model
-        self.last_reasoning = ""
+        self.last_reasoning: str = "Selection process not started."
 
     def select_ui_element_for_click(
             self,
             elements: UIElementCollection,
             element_desc: str,
-            cv2_screenshot: Optional[np.ndarray],
-            vis_img: Optional[np.ndarray]
+            cv2_screenshot: Optional[np.ndarray], # Changed type hint
+            vis_img: Optional[np.ndarray] # Changed type hint
         ) -> Tuple[Optional[int], Dict[str, int]]:
 
-            # Initialize token_usage for this specific LLM call
             llm_call_token_usage = {"prompt_tokens": 0, "candidates_tokens": 0, "total_tokens": 0}
             self.last_reasoning = "Selection process not started."
 
@@ -31,61 +29,51 @@ class UIAgent:
                 return None, llm_call_token_usage
 
             if cv2_screenshot is None:
-                logging.error("Cannot select UI element without a screenshot.")
-                self.last_reasoning = "Missing screenshot for visual analysis."
+                logging.error("Cannot select UI element without a screenshot (cv2_screenshot is None).")
+                self.last_reasoning = "Missing screenshot for visual analysis (cv2_screenshot was None)."
                 return None, llm_call_token_usage
 
-            # Try pattern matching first for common cases
-            element_desc_lower = element_desc.lower()
-            
-            # Common button patterns
-            button_patterns = {
-                'ok': ['ok', 'okay', 'confirm', 'done', 'finish'],
-                'cancel': ['cancel', 'close', 'exit', 'back'],
-                'yes': ['yes', 'confirm', 'agree', 'accept'],
-                'no': ['no', 'decline', 'reject', 'deny'],
-                'next': ['next', 'continue', 'proceed', 'forward'],
-                'previous': ['previous', 'back', 'return'],
-                'save': ['save', 'store', 'keep'],
-                'delete': ['delete', 'remove', 'erase', 'clear']
-            }
-
-            # Check for exact matches first
-            for i, elem in enumerate(elements):
-                elem_label_lower = elem.label.lower()
-                
-                # Exact match
-                if element_desc_lower == elem_label_lower:
-                    self.last_reasoning = f"Found exact match for '{element_desc}'"
-                    return i, llm_call_token_usage
-                
-                # Check button patterns
-                for pattern, keywords in button_patterns.items():
-                    if any(keyword in elem_label_lower for keyword in keywords) and pattern in element_desc_lower:
-                        self.last_reasoning = f"Found button pattern match for '{element_desc}'"
-                        return i, llm_call_token_usage
-
-            # If no pattern match found, proceed with AI model
             elements_description = []
             for i, elem in enumerate(elements):
                 label = elem.label.strip() if elem.label else "[No Label]"
-                desc = f"Element {i}: Type='{elem.element_type}', Label='{label[:50]}{'...' if len(label)>50 else ''}', Center=({int(elem.center[0])},{int(elem.center[1])})"
-                elements_description.append(desc)
+                desc_str = f"Element {i}: Type='{elem.element_type}', Label='{label[:50]}{'...' if len(label)>50 else ''}', Center=({int(elem.center[0])},{int(elem.center[1])})"
+                elements_description.append(desc_str)
 
             if not elements_description:
                 logging.warning("UI elements list was empty after formatting descriptions.")
                 self.last_reasoning = "Detected UI elements list was empty or could not be processed."
                 return None, llm_call_token_usage
 
-            elements_text = "\n".join(elements_description)
-
-            orig_pil = cv2_to_pil(cv2_screenshot)
+            elements_text = "\n".join(elements_description)            
+            # Convert cv2_screenshot (NumPy array) to PIL Image
+            orig_pil = None
+            if cv2_screenshot is not None: # cv2_screenshot is np.ndarray
+                try:
+                    orig_pil = cv2_to_pil(cv2_screenshot) 
+                    if orig_pil is None:
+                        logging.error("cv2_to_pil returned None for original screenshot.")
+                        self.last_reasoning = "Error processing original screenshot (conversion to PIL failed)."
+                        return None, llm_call_token_usage
+                except Exception as e:
+                    logging.error(f"Failed to convert cv2_screenshot (NumPy array) to PIL: {e}")
+                    self.last_reasoning = "Error processing original screenshot (conversion exception)."
+                    return None, llm_call_token_usage
+            else: # This case should have been caught earlier, but as a safeguard
+                logging.error("cv2_screenshot became None unexpectedly before PIL conversion.")
+                self.last_reasoning = "Internal error: screenshot became unavailable."
+                return None, llm_call_token_usage
+            
             orig_base64 = image_to_base64(orig_pil)
 
-            vis_base64 = None
-            if vis_img is not None:
-                vis_pil = cv2_to_pil(vis_img)
-                vis_base64 = image_to_base64(vis_pil)
+            # Convert vis_img (NumPy array) to PIL Image
+            vis_pil = None
+            if vis_img is not None: # vis_img is np.ndarray or None
+                try:
+                    vis_pil = cv2_to_pil(vis_img) 
+                except Exception as e:
+                    logging.warning(f"Failed to convert vis_img (NumPy array) to PIL: {e}")
+            vis_base64 = image_to_base64(vis_pil) if vis_pil else None
+
 
             if not orig_base64:
                 logging.error("Failed to convert original screenshot to base64.")
@@ -97,11 +85,11 @@ class UIAgent:
                 "\nI'm providing image(s) and a list of detected UI elements:",
                 "\n1. FIRST IMAGE: The original screenshot.",
             ]
-            content = [{"inline_data": {"mime_type": "image/png", "data": orig_base64}}]
+            content_for_llm = [{"inline_data": {"mime_type": "image/png", "data": orig_base64}}]
 
             if vis_base64:
                 prompt_parts.append("\n2. SECOND IMAGE: Visualization with numbered boxes highlighting detected elements (numbers match indices below).")
-                content.append({"inline_data": {"mime_type": "image/png", "data": vis_base64}})
+                content_for_llm.append({"inline_data": {"mime_type": "image/png", "data": vis_base64}})
             else:
                 prompt_parts.append("\n(Note: Visualization image is not available.)")
 
@@ -117,6 +105,8 @@ class UIAgent:
                 prompt_parts.append("- Rely heavily on element labels, types, and positions in the list compared to the original screenshot.")
 
             prompt_parts.extend([
+                "\n\n**Specific Guidance for Common Elements:**",
+                "- **Video Thumbnails/Links:** Often appear as rectangular images with titles. The clickable area is usually the image or the title text. Look for elements with labels matching video titles or generic descriptions like 'video thumbnail'. If multiple similar items exist (e.g., search results), use relative position (e.g., 'first', 'top-most') if specified in the user's request.",
                 "\nIMPORTANT: Provide step-by-step reasoning.",
                 "1. Describe what you visually identify in the original screenshot matching the request.",
                 "2. Examine the element list for candidates based on label, type, and location.",
@@ -128,27 +118,29 @@ class UIAgent:
             ])
 
             prompt_text = "\n".join(prompt_parts)
-            content.insert(0, {"text": prompt_text})
+            content_for_llm.insert(0, {"text": prompt_text})
 
             try:
-                safety_settings = {}
-                response = self.model.generate_content(content, safety_settings=safety_settings)
+                safety_settings = {} # Define safety settings if needed
+                response = self.model.generate_content(content_for_llm, safety_settings=safety_settings)
                 llm_call_token_usage = _get_token_usage(response)
                 txt = ""
                 if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
                     txt = "".join(part.text for part in response.candidates[0].content.parts if hasattr(part, 'text')).strip()
 
                 if not txt:
-                    if response.prompt_feedback.block_reason:
-                        block_reason = response.prompt_feedback.block_reason
-                        logging.error(f"LLM response blocked: {block_reason}")
-                        self.last_reasoning = f"LLM response blocked ({block_reason})."
-                    else:
-                        logging.error("LLM response was empty.")
-                        self.last_reasoning = "LLM returned empty response."
+                    block_reason = "Unknown"
+                    if hasattr(response, 'prompt_feedback') and response.prompt_feedback and hasattr(response.prompt_feedback, 'block_reason') and response.prompt_feedback.block_reason:
+                        block_reason = str(response.prompt_feedback.block_reason)
+                    logging.error(f"LLM response blocked: {block_reason}")
+                    self.last_reasoning = f"LLM response blocked ({block_reason})."
                     return None, llm_call_token_usage
 
                 logging.info(f"[UI Agent Raw Response]\n{txt}")
+            except ValueError as ve:
+                logging.error(f"ValueError accessing LLM response: {ve}")
+                self.last_reasoning = f"LLM response likely blocked. ValueError: {ve}"
+                return None, llm_call_token_usage
             except Exception as e:
                 logging.error(f"Error getting response from Gemini: {e}")
                 self.last_reasoning = f"Error communicating with LLM: {e}"
@@ -177,7 +169,7 @@ class UIAgent:
                         else:
                             logging.warning(f"LLM selected invalid index: {selected_idx} (max: {len(elements)-1}).")
                             reasoning += f"\n(Agent Note: LLM selected invalid index {selected_idx}.)"
-                            selection = None
+                            selection = None # Explicitly set to None
                     except ValueError:
                         logging.warning(f"Could not convert selected text '{selection_text}' to int.")
                         selection = None
@@ -209,8 +201,7 @@ class UIAgent:
                                 logging.warning(f"Fallback number {potential_idx} out of bounds.")
                         except ValueError:
                             pass
-
+            
             self.last_reasoning = reasoning
             logging.info(f"LLM selected element index: {selection}" if selection is not None else "LLM did not select a valid index.")
             return selection, llm_call_token_usage
-

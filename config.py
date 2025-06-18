@@ -195,6 +195,7 @@ try:
         task_executions_collection = get_or_create_collection("task_executions")
         reinforcements_collection = get_or_create_collection("reinforcements")
         user_task_structures_collection = get_or_create_collection("user_task_structures")
+        app_shortcuts_collection = get_or_create_collection("app_shortcuts") # New collection for shortcuts
         
         # Verify collections are working
         task_executions_collection.count()
@@ -202,6 +203,7 @@ try:
         user_task_structures_collection.count()
         
         logging.info(f"ChromaDB initialized. Collections 'task_executions', 'reinforcements', and 'user_task_structures' ready.")
+        logging.info(f"ChromaDB collection 'app_shortcuts' count: {app_shortcuts_collection.count()}")
         logging.info(f"ChromaDB data path: {CHROMA_DATA_PATH}")
         logging.info(f"Task executions collection count: {task_executions_collection.count()}")
         logging.info(f"Reinforcements collection count: {reinforcements_collection.count()}")
@@ -222,6 +224,7 @@ try:
             task_executions_collection = get_or_create_collection("task_executions")
             reinforcements_collection = get_or_create_collection("reinforcements")
             user_task_structures_collection = get_or_create_collection("user_task_structures")
+            app_shortcuts_collection = get_or_create_collection("app_shortcuts") # New collection for shortcuts
             
             logging.info("ChromaDB reset successful")
             print(f"{GREEN}[OK] ChromaDB reset and reinitialized successfully.{RESET}")
@@ -236,3 +239,4 @@ except Exception as e:
     task_executions_collection = None
     reinforcements_collection = None
     user_task_structures_collection = None
+    app_shortcuts_collection = None

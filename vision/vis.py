@@ -26,38 +26,14 @@ ui_cache = UICache()
 
 def locate_and_click_ui_element(element_desc: str, agent: UIAgent) -> Tuple[bool, str]:
     """
-    Pipeline for clicking a specific UI element. Uses caching and optimized detection.
+    Pipeline for clicking a specific UI element. Captures screen, detects/caches elements,
+    uses UIAgent to select, and performs the click.
     Returns Tuple[bool, str] indicating success and a message.
     """
     logging.info(f"Attempting to locate and click UI element: '{element_desc}'")
     error_prefix = "Click failed: "
 
-    # Get window info for relative positioning
-    try:
-        import win32gui
-        hwnd = win32gui.GetForegroundWindow()
-        window_rect = win32gui.GetWindowRect(hwnd)
-        app_name = get_active_window_name()
-    except Exception as e:
-        logging.warning(f"Could not get window info: {e}")
-        window_rect = None
-        app_name = get_active_window_name()
 
-    # Try hot path cache first
-    if window_rect:
-        cached_pos = ui_cache.get_from_hot_path(app_name, element_desc, window_rect)
-        if cached_pos:
-            x, y = cached_pos
-            try:
-                logging.info(f"Using cached position for '{element_desc}' at ({x}, {y})")
-                pyautogui.moveTo(x, y, duration=0.25)
-                pyautogui.click(x, y)
-                time.sleep(0.5)
-                return True, f"Successfully clicked '{element_desc}' using cached position."
-            except Exception as e:
-                logging.warning(f"Failed to use cached position: {e}")
-
-    # If hot path cache fails, proceed with full detection
     pil_screenshot = capture_full_screen()
     if pil_screenshot is None:
         return False, error_prefix + "Could not capture screen."
@@ -65,7 +41,13 @@ def locate_and_click_ui_element(element_desc: str, agent: UIAgent) -> Tuple[bool
     if cv2_screenshot is None:
         return False, error_prefix + "Could not convert screenshot."
 
-    # Get UI elements with caching
+
+    app_name = get_active_window_name()
+    logging.info(f"Active application context for UI elements: {app_name}")
+
+
+
+
     ui_elements = ui_cache.get_ui_elements(cv2_screenshot, app_name)
     if not ui_elements:
         msg = f"No UI elements detected/cached for the current screen ('{app_name}')."
@@ -76,17 +58,20 @@ def locate_and_click_ui_element(element_desc: str, agent: UIAgent) -> Tuple[bool
 
     logging.info(f"Working with {len(ui_elements)} UI elements for '{app_name}'")
 
-    # Create visualization for debugging
+
     vis_img = visualize_ui_elements(cv2_screenshot, ui_elements)
+
+
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     debug_session_dir = save_debug_data(
         app_name, timestamp, cv2_screenshot, vis_img, ui_elements
     )
 
-    # Use AI agent to select element
+
     matching_idx, token_usage = agent.select_ui_element_for_click(
         ui_elements, element_desc, cv2_screenshot, vis_img
     )
+
 
     logging.info(f"UI Element Selection Reasoning:\n{agent.last_reasoning}\n")
 
@@ -102,69 +87,80 @@ def locate_and_click_ui_element(element_desc: str, agent: UIAgent) -> Tuple[bool
                 logging.error(f"Could not write failed search info: {e}")
         return False, error_prefix + msg
 
+
     try:
         matching_element = ui_elements[matching_idx]
         x = int(matching_element.center[0])
         y = int(matching_element.center[1])
+    except IndexError:
+        msg = f"Internal error: Index {matching_idx} out of bounds (size {len(ui_elements)})."
+        logging.error(msg)
+        return False, error_prefix + msg
+    except (TypeError, ValueError) as e:
+        msg = f"Error processing coords for index {matching_idx}: {e}. Center: {getattr(matching_element, 'center', 'N/A')}"
+        logging.error(msg)
+        return False, error_prefix + msg
+    except Exception as e:
+        msg = f"Error accessing element at index {matching_idx}: {e}"
+        logging.error(msg)
+        return False, error_prefix + msg
 
-        # Update hot path cache if window info is available
-        if window_rect:
-            ui_cache.update_hot_path(app_name, element_desc, matching_element, window_rect)
 
-        element_label_short = matching_element.label[:50] + (
-            "..." if len(matching_element.label) > 50 else ""
-        )
-        match_log_msg = f"Match found: Index={matching_idx}, Type='{matching_element.element_type}', Label='{element_label_short}', Center=({x},{y})"
-        logging.info(f"[OK] {match_log_msg}")
+    element_label_short = matching_element.label[:50] + (
+        "..." if len(matching_element.label) > 50 else ""
+    )
+    match_log_msg = f"Match found: Index={matching_idx}, Type='{matching_element.element_type}', Label='{element_label_short}', Center=({x},{y})"
+    logging.info(f"[OK] {match_log_msg}")
 
-        # Save debug info
-        if debug_session_dir:
-            match_info_path = os.path.join(debug_session_dir, "match_successful.txt")
-            try:
-                with open(match_info_path, "w", encoding="utf-8") as f:
-                    f.write(f"Search term: {element_desc}\n")
-                    f.write(f"Matched index: {matching_idx}\n")
-                    f.write(f"Element: {vars(matching_element)}\n")
-                    f.write(f"Reasoning:\n{agent.last_reasoning}\n")
 
-                match_vis_img = cv2_screenshot.copy()
-                half_width, half_height = int(matching_element.width / 2), int(
-                    matching_element.height / 2
-                )
-                x1, y1, x2, y2 = (
-                    x - half_width,
-                    y - half_height,
-                    x + half_width,
-                    y + half_height,
-                )
-                cv2.rectangle(match_vis_img, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                label_text = f"Match ({matching_idx}): {matching_element.label[:30]}"
-                (tw, th), bl = cv2.getTextSize(
-                    label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
-                )
-                ty = y1 - 10 if y1 - 10 > th else y2 + th + 5
-                cv2.rectangle(
-                    match_vis_img,
-                    (x1, ty - th - bl),
-                    (x1 + tw, ty + bl),
-                    (0, 255, 0),
-                    cv2.FILLED,
-                )
-                cv2.putText(
-                    match_vis_img,
-                    label_text,
-                    (x1, ty),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 0, 0),
-                    2,
-                )
-                match_vis_path = os.path.join(debug_session_dir, "matched_element_highlight.png")
-                cv2.imwrite(match_vis_path, match_vis_img)
-            except Exception as e:
-                logging.error(f"Could not write successful match info/vis: {e}")
+    if debug_session_dir:
+        match_info_path = os.path.join(debug_session_dir, "match_successful.txt")
+        try:
+            with open(match_info_path, "w", encoding="utf-8") as f:
+                f.write(f"Search term: {element_desc}\n")
+                f.write(f"Matched index: {matching_idx}\n")
+                f.write(f"Element: {vars(matching_element)}\n")
+                f.write(f"Reasoning:\n{agent.last_reasoning}\n")
 
-        # Perform click
+            match_vis_img = cv2_screenshot.copy()
+            half_width, half_height = int(matching_element.width / 2), int(
+                matching_element.height / 2
+            )
+            x1, y1, x2, y2 = (
+                x - half_width,
+                y - half_height,
+                x + half_width,
+                y + half_height,
+            )
+            cv2.rectangle(match_vis_img, (x1, y1), (x2, y2), (0, 255, 0), 3)
+            label_text = f"Match ({matching_idx}): {matching_element.label[:30]}"
+            (tw, th), bl = cv2.getTextSize(
+                label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+            )
+            ty = y1 - 10 if y1 - 10 > th else y2 + th + 5
+            cv2.rectangle(
+                match_vis_img,
+                (x1, ty - th - bl),
+                (x1 + tw, ty + bl),
+                (0, 255, 0),
+                cv2.FILLED,
+            )
+            cv2.putText(
+                match_vis_img,
+                label_text,
+                (x1, ty),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 0),
+                2,
+            )
+            match_vis_path = os.path.join(debug_session_dir, "matched_element_highlight.png")
+            cv2.imwrite(match_vis_path, match_vis_img)
+        except Exception as e:
+            logging.error(f"Could not write successful match info/vis: {e}")
+
+
+    try:
         logging.info(f"Performing click action at ({x}, {y})")
         pyautogui.moveTo(x, y, duration=0.25)
         pyautogui.click(x, y)
@@ -172,9 +168,8 @@ def locate_and_click_ui_element(element_desc: str, agent: UIAgent) -> Tuple[bool
         logging.info(success_msg)
         time.sleep(0.5)
         return True, success_msg
-
     except Exception as e:
-        msg = f"Error during click operation: {e}"
+        msg = f"Error during pyautogui click at ({x},{y}): {e}"
         logging.error(msg)
         return False, error_prefix + msg
 

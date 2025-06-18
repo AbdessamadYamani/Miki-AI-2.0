@@ -27,7 +27,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 
 from config import CONFIRM_RISKY_COMMANDS,DEBUG_DIR,get_model as model
-
+from config import CONFIRM_RISKY_COMMANDS # Already imported, but good to note
 # Supported file types for Gemini API (moved from test_files.py)
 SUPPORTED_MIME_TYPES = [
     'application/pdf',
@@ -126,7 +126,11 @@ def _execute_write_file(file_path: str, content: str, append: bool = False) -> T
         return False, f"Unexpected error {action_desc} file '{file_path}': {e}"
 
 
-def execute_shell_command(command: str, working_directory: Optional[str] = None, allow_confirmation_prompt: bool = True) -> Union[Tuple[int, str], Tuple[int, str, Dict[str, Any]]]:
+def execute_shell_command(
+    command: str, 
+    working_directory: Optional[str] = None, 
+    allow_confirmation_prompt: bool = True,
+    bypass_confirmation_flag: bool = False) -> Union[Tuple[int, str], Tuple[int, str, Dict[str, Any]]]:
     import shlex # Import shlex at the top of the function
     log_suffix = f" in '{working_directory}'" if working_directory else ""
     logging.info(f"Attempting to execute shell command: {command}{log_suffix}")
@@ -155,18 +159,20 @@ def execute_shell_command(command: str, working_directory: Optional[str] = None,
     command_lower = command.lower().strip()
     is_risky = any(keyword in command_lower for keyword in risky_keywords)
 
-    if is_risky and CONFIRM_RISKY_COMMANDS and allow_confirmation_prompt:
-        logging.warning(f"[WARNING] Command '{command}' identified as potentially risky.")
-        confirmation_question = (
-            f"[RISKY COMMAND]\nThe agent wants to run:\n`{command}`"
-            f"{f' in directory: {effective_cwd}' if effective_cwd else ''}\n\n"
-            "Allow execution? (Type 'yes' to allow, anything else to deny)"
-        )
-        # Return code -2 signifies a need for user confirmation
-        return -2, "Confirmation required for risky command.", {"type": "ask_user", "question": confirmation_question}
-    elif is_risky and not allow_confirmation_prompt: # Risky command in a non-interactive context (e.g., multi_action)
-        logging.warning(f"Risky command '{command}' encountered within a non-interactive context. Skipping confirmation and failing.")
-        return -1, f"Risky command '{command}' cannot be confirmed in this context. Action failed."
+    if not bypass_confirmation_flag: # Only check for risky if not already bypassed
+        if is_risky and CONFIRM_RISKY_COMMANDS:
+            if allow_confirmation_prompt:
+                logging.warning(f"[WARNING] Command '{command}' identified as potentially risky.")
+                confirmation_question = (
+                    f"[RISKY COMMAND]\nThe agent wants to run:\n`{command}`"
+                    f"{f' in directory: {effective_cwd}' if effective_cwd else ''}\n\n"
+                    "Allow execution? (Type 'yes' to allow, anything else to deny)"
+                )
+                # Return code -2 signifies a need for user confirmation
+                return -2, "Confirmation required for risky command.", {"type": "ask_user", "question": confirmation_question}
+            else: # Risky command in a non-interactive context (e.g., multi_action)
+                logging.warning(f"Risky command '{command}' encountered within a non-interactive context (allow_confirmation_prompt=False). Action failed.")
+                return -1, f"Risky command '{command}' cannot be auto-confirmed in this context. Action failed."
 
     # --- Determine command type and prepare Python command if necessary ---
     is_python_command_execution = False
@@ -343,12 +349,77 @@ def execute_shell_command(command: str, working_directory: Optional[str] = None,
                 return 0, f"Command OK. {output}"
             else:
                 logging.error(f"Blocking command '{command}' failed (Code: {result.returncode}). {output}")
-                return result.returncode, f"Command '{command}' failed (Code: {result.returncode}). {output}"
+                # If initial attempt failed on Windows, try with PowerShell
+                if sys.platform == "win32":
+                    logging.info(f"Initial attempt for '{command}' failed. Retrying with PowerShell...")
+                    ps_command_str = f'& {{{command}}}' # PowerShell command block
+                    try:
+                        ps_run_result = subprocess.run(
+                            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_command_str],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace",
+                            check=False, timeout=blocking_timeout, env=os.environ.copy(), cwd=effective_cwd,
+                            shell=False # Calling powershell.exe directly
+                        )
+                        ps_stdout = ps_run_result.stdout.strip() if ps_run_result.stdout else ""
+                        ps_stderr = ps_run_result.stderr.strip() if ps_run_result.stderr else ""
+                        ps_combined_output = ""
+                        if ps_stderr and ps_run_result.returncode != 0:
+                            ps_combined_output = f"PowerShell Error Output:\n{ps_stderr}" + (f"\nPowerShell Standard Output:\n{ps_stdout}" if ps_stdout else "")
+                        else:
+                            ps_combined_output = f"PowerShell Standard Output:\n{ps_stdout}" if ps_stdout else "(No PowerShell output)"
+                            if ps_stderr: ps_combined_output += f"\nPowerShell Error Output (but command may have succeeded):\n{ps_stderr}"
+
+                        if ps_run_result.returncode == 0:
+                            logging.info(f"PowerShell retry for '{command}' succeeded.")
+                            return 0, f"Command OK (via PowerShell retry). {ps_combined_output}"
+                        else:
+                            logging.error(f"PowerShell retry for '{command}' failed (Code: {ps_run_result.returncode}).\n{ps_combined_output}")
+                            return result.returncode, f"Command failed (Original Code: {result.returncode}). PowerShell retry also failed (Code: {ps_run_result.returncode}).\nOriginal Output:\n{output}\nPowerShell Output:\n{ps_combined_output}"
+                    except Exception as ps_e:
+                        logging.error(f"Exception during PowerShell retry for '{command}': {ps_e}", exc_info=True)
+                        # Fallthrough to return original error if PowerShell retry itself had an exception
+                return result.returncode, f"Command '{command}' failed (Code: {result.returncode}). {output}" # Original failure if not Windows or PS retry fails
 
     except FileNotFoundError:
         cmd_name_fnf = command.split()[0]
         logging.error(f"Command not found or not executable: '{cmd_name_fnf}' in command '{command}'{log_suffix}")
-        return -1, f"Command not found/executable: {cmd_name_fnf}. Ensure it's in PATH or use full path."
+        if sys.platform == "win32":
+            logging.info(f"Command '{command}' not found. Retrying with PowerShell...")
+            ps_command_str_fnf = f'& {{{command}}}'
+            blocking_timeout_fnf = 180 # Define timeout for this specific retry
+            try:
+                ps_run_result_fnf = subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_command_str_fnf],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    check=False, timeout=blocking_timeout_fnf, env=os.environ.copy(), cwd=effective_cwd,
+                    shell=False
+                )
+                ps_stdout_fnf = ps_run_result_fnf.stdout.strip() if ps_run_result_fnf.stdout else ""
+                ps_stderr_fnf = ps_run_result_fnf.stderr.strip() if ps_run_result_fnf.stderr else ""
+                ps_combined_output_fnf = ""
+                if ps_stderr_fnf and ps_run_result_fnf.returncode != 0:
+                     ps_combined_output_fnf = f"PowerShell Error Output:\n{ps_stderr_fnf}" + (f"\nPowerShell Standard Output:\n{ps_stdout_fnf}" if ps_stdout_fnf else "")
+                else:
+                     ps_combined_output_fnf = f"PowerShell Standard Output:\n{ps_stdout_fnf}" if ps_stdout_fnf else "(No PowerShell output)"
+                     if ps_stderr_fnf: ps_combined_output_fnf += f"\nPowerShell Error Output (but command may have succeeded):\n{ps_stderr_fnf}"
+
+                if ps_run_result_fnf.returncode == 0:
+                    logging.info(f"PowerShell retry for '{command}' (after FNF) succeeded.")
+                    return 0, f"Command OK (via PowerShell retry after FNF). {ps_combined_output_fnf}"
+                else:
+                    logging.error(f"PowerShell retry for '{command}' (after FNF) also failed (Code: {ps_run_result_fnf.returncode}).\n{ps_combined_output_fnf}")
+                    return -1, f"Command not found/executable: {cmd_name_fnf}. PowerShell retry also failed (Code: {ps_run_result_fnf.returncode}).\nPowerShell Output:\n{ps_combined_output_fnf}"
+            except FileNotFoundError: # powershell.exe not found
+                logging.error("PowerShell executable not found. Cannot retry with PowerShell.")
+                return -1, f"Command not found/executable: {cmd_name_fnf}. (PowerShell not found for retry)"
+            except subprocess.TimeoutExpired:
+                logging.error(f"PowerShell retry for '{command}' (after FNF) timed out.")
+                return -1, f"Command not found/executable: {cmd_name_fnf}. (PowerShell retry timed out)"
+            except Exception as ps_e_fnf:
+                logging.error(f"Exception during PowerShell retry for '{command}' (after FNF): {ps_e_fnf}", exc_info=True)
+                return -1, f"Command not found/executable: {cmd_name_fnf}. (PowerShell retry exception: {ps_e_fnf})"
+        else: # Not Windows
+            return -1, f"Command not found/executable: {cmd_name_fnf}. Ensure it's in PATH or use full path."
     except PermissionError:
         logging.error(f"Permission denied executing: {command}{log_suffix}")
         return -1, f"Permission denied executing command: {command}"
@@ -375,8 +446,6 @@ def execute_shell_command(command: str, working_directory: Optional[str] = None,
                 if hasattr(process, 'stderr') and process.stderr: process.stderr.close()
             except Exception as e_cleanup:
                 logging.warning(f"Error during Popen cleanup for '{command}': {e_cleanup}")
-
-
 
 
 
@@ -518,11 +587,29 @@ def execute_action(action: dict, agent: 'UIAgent') -> Union[Tuple[bool, str], Tu
                 return success, message, None
 
             elif action_type == "click":
-                desc = parameters.get("element_description")
-                if not desc: return False, "Action 'click' failed: Missing 'element_description'.", None
-                # locate_and_click_ui_element returns (success, message)
-                click_success, click_message = locate_and_click_ui_element(desc, agent)
-                return click_success, click_message, {"type": "click_result", "token_usage": action_token_usage}
+                x_coord_param = parameters.get("x")
+                y_coord_param = parameters.get("y")
+
+                if x_coord_param is not None and y_coord_param is not None:
+                    try:
+                        x_click = int(x_coord_param)
+                        y_click = int(y_coord_param)
+                        logging.info(f"Performing direct coordinate click at ({x_click}, {y_click})")
+                        pyautogui.moveTo(x_click, y_click, duration=0.25)
+                        pyautogui.click(x_click, y_click)
+                        time.sleep(0.5) # Small delay after click
+                        return True, f"Successfully clicked at coordinates ({x_click}, {y_click}).", {"type": "click_result", "token_usage": ZERO_TOKEN_USAGE}
+                    except (ValueError, TypeError) as e_coord:
+                        return False, f"Action 'click' with coordinates failed: Invalid coordinate values ({x_coord_param}, {y_coord_param}). Error: {e_coord}", None
+                    except Exception as e_pyauto_coord:
+                        return False, f"Action 'click' with coordinates failed during pyautogui operation: {e_pyauto_coord}", None
+                else:
+                    # Fallback to element description based click
+                    desc = parameters.get("element_description")
+                    if not desc: return False, "Action 'click' failed: Missing 'element_description' or coordinates.", None
+                    click_success, click_message = locate_and_click_ui_element(desc, agent)
+                    # Token usage for UIAgent.select_ui_element_for_click is handled within AgentState/TaskSession
+                    return click_success, click_message, {"type": "click_result", "token_usage": ZERO_TOKEN_USAGE} # Placeholder for action's direct tokens
 
             elif action_type == "type":
                 text = parameters.get("text_to_type")
@@ -617,7 +704,11 @@ def execute_action(action: dict, agent: 'UIAgent') -> Union[Tuple[bool, str], Tu
                 if not command or not isinstance(command, str):
                     return False, "Action 'run_shell_command' failed: Missing/invalid 'command'.", None
                 allow_confirm = parameters.get("_is_top_level_action_", True)
-                shell_result = execute_shell_command(command, working_directory=working_directory, allow_confirmation_prompt=allow_confirm)
+                bypass_confirm = action.get("_bypass_confirmation_", False) # Get the bypass flag
+                shell_result = execute_shell_command(
+                    command, working_directory=working_directory, 
+                    allow_confirmation_prompt=allow_confirm,
+                    bypass_confirmation_flag=bypass_confirm)
                 if isinstance(shell_result, tuple) and len(shell_result) == 3 and shell_result[0] == -2: # type: ignore
                     return shell_result # type: ignore
                 exit_code, output_msg = shell_result # type: ignore
@@ -705,6 +796,7 @@ def execute_action(action: dict, agent: 'UIAgent') -> Union[Tuple[bool, str], Tu
                 desc = parameters.get("element_description")
                 text = parameters.get("text_to_type")
                 interval = parameters.get("interval_seconds", 0.05)
+                press_enter_after = parameters.get("press_enter_after", False) # New parameter
                 if not desc: return False, "Action 'click_and_type' failed: Missing 'element_description'.", None
                 if text is None: return False, "Action 'click_and_type' failed: Missing 'text_to_type'.", None
                 logging.info(f"[click_and_type] Performing click on: '{desc}'")
@@ -721,7 +813,12 @@ def execute_action(action: dict, agent: 'UIAgent') -> Union[Tuple[bool, str], Tu
                     time.sleep(0.3)
                     pyautogui.typewrite(text, interval=interval_f) # type: ignore
                     log_text = (text[:50] + '...') if len(text) > 53 else text # type: ignore
-                    return True, f"Clicked '{desc}' and typed text: '{log_text}'", {"type": "click_and_type_success", "token_usage": action_token_usage}
+                    message = f"Clicked '{desc}' and typed text: '{log_text}'"
+                    if press_enter_after:
+                        pyautogui.press('enter')
+                        message += " and pressed Enter."
+                        logging.info(f"[click_and_type] Pressed Enter after typing.")
+                    return True, message, {"type": "click_and_type_success", "token_usage": action_token_usage}
                 except ValueError:
                     return False, f"Action 'click_and_type' failed during type: Invalid 'interval_seconds': {interval}.", {"type": "type_failed", "token_usage": action_token_usage}
                 except Exception as e:
@@ -839,8 +936,6 @@ def execute_action(action: dict, agent: 'UIAgent') -> Union[Tuple[bool, str], Tu
     except Exception as e:
         logging.error(f"Unexpected error during execution of action '{action_type}': {e}", exc_info=True)
         return False, f"Action '{action_type}' failed due to runtime error: {e}", None
-
-
 
 
 

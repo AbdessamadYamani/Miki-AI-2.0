@@ -576,5 +576,3 @@ def main():
         else:
             print("No search results found")
 
-if __name__ == "__main__":
-    main()

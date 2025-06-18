@@ -301,22 +301,3 @@ DECISION: [PASS or FAIL]
     except Exception as e:
         logging.error(f"Error during critique LLM call: {e}", exc_info=True)
         return False, f"Critique failed: API error occurred. {str(e)}", {"prompt_tokens": 0, "candidates_tokens": 0, "total_tokens": 0}
-
-def process_next_step(
-    original_instruction: str,
-    history: List[str],
-    llm_model: genai.GenerativeModel,
-    current_shortcuts: Optional[str] = None,
-    current_reinforcements: List[str] = None,
-    planning_screenshot_pil: Optional[Image.Image] = None,
-    benchmark_mode: bool = False,
-    executed_actions_summary: Optional[str] = None
-) -> Tuple[Optional[dict], Dict[str, int]]:
-    # Check if we already have a successful image generation
-    if llm_model is None:
-        llm_model = get_model()
-        if llm_model is None:
-            logging.error("LLM model is None and could not be initialized")
-            return None, {"prompt_tokens": 0, "candidates_tokens": 0, "total_tokens": 0}
-
-    # ... rest of the function ...

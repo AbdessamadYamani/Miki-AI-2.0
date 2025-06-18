@@ -3,12 +3,13 @@ import os
 import logging,re
 import google.generativeai as genai
 from PIL import  Image
-from tools.token_usage_tool import _get_token_usage
-from vision.vis import image_to_base64,_hash_pil_image,capture_full_screen
+from tools.token_usage_tool import _get_token_usage # type: ignore
+from vision.vis import _hash_pil_image,capture_full_screen # Keep these from vision.vis
+from utils.image_utils import image_to_base64 # Import this from the new utility file
 import json
 import demjson3
 from agents.ai_agent import UIAgent
-from tools.shortcuts_tool import load_shortcuts_cache 
+from tools.shortcuts_tool import load_shortcuts_cache
 from tools.web_search_tool import search_web_for_info
 from datetime import datetime 
 from task_exec.tasks_management import save_task_execution_to_db, find_similar_user_task_structure
@@ -16,8 +17,8 @@ from task_exec.tasks_management import _analyze_and_categorize_task
 from utils.app_name import get_base_app_name
 from chromaDB_management.cache import sanitize_filename,get_active_window_name
 from tools.shortcuts_tool import load_shortcuts_cache, get_application_shortcuts # Import shortcuts tool functions
-
-from task_exec.task_planner import critique_action
+from task_exec.tasks_management import retrieve_similar_task_executions_from_db # Added for plan adaptation
+from task_exec.task_planner import critique_action # Assuming process_next_step is also in task_planner or imported elsewhere
 from tools.actions import execute_action
 import time # Removed datetime from here
 from chromaDB_management.credential import save_credential
@@ -25,14 +26,14 @@ from utils.reinforcement_util import retrieve_relevant_reinforcements_from_db
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from config import (
-    get_model, get_critic_model, DEBUG_DIR
+from config import ( # type: ignore
+    get_model, get_critic_model, DEBUG_DIR,BLUE, CONFIRM_RISKY_COMMANDS
 )
 from tools.files_upload import process_files_from_urls
 
 # Add this near the top of the file or where VALID_ACTIONS or similar is defined
 VALID_ACTIONS = {
-    "focus_window", "click", "type", "press_keys", "move_mouse", "run_shell_command", "run_python_script", "write_file", "navigate_web", "search_web", "search_youtube", "wait", "ask_user", "describe_screen", "capture_screenshot", "click_and_type", "multi_action", "task_complete", "read_file", "INFORM_USER", "process_local_files", "process_files_from_urls", "start_visual_listener", "edit_image_with_file"
+    "focus_window", "click", "type", "press_keys", "move_mouse", "run_shell_command", "run_python_script", "write_file", "navigate_web", "search_web", "search_youtube", "wait", "ask_user", "describe_screen", "capture_screenshot", "click_and_type", "multi_action", "task_complete", "read_file", "INFORM_USER", "process_local_files", "process_files_from_urls", "start_visual_listener", "edit_image_with_file", "refresh_application_shortcuts"
 }
 
 def _normalize_instruction(instruction: str) -> str:
@@ -74,7 +75,7 @@ def assess_action_outcome(
             files = exec_message.get('files', [])
             
             # Format the message in a structured way
-            message = "File Processing Results\n"
+            message = "📄 File Processing Results\n"
             message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             
             if source == "local":
@@ -87,7 +88,7 @@ def assess_action_outcome(
                     message += f"🔗 URL: {url}\n"
                     
             message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            message += f"Analysis:\n{result}\n"
+            message += f"📝 Analysis:\n{result}\n"
             message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             
             return "SUCCESS", message, token_usage
@@ -434,6 +435,139 @@ def request_replan_from_failure(
         logging.error(f"Error during replanning LLM call: {e}", exc_info=True)
         return None, {"prompt_tokens": 0, "candidates_tokens": 0, "total_tokens": 0}
 
+def _extract_search_query_from_instruction(instruction: str) -> Optional[str]:
+    """
+    Attempts to extract a search query from a "play X on Y" type instruction.
+    Example: "play genius by sia on youtube" -> "genius by sia"
+    """
+    # Regex to capture the content between "play" and "on youtube" (or similar)
+    # It's a simple heuristic and might need refinement for more complex cases.
+    match = re.search(r"play\s+(.+?)\s+(?:on|in)\s+(youtube|spotify|soundcloud)", instruction, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    # Fallback for simpler "search for X" or "find X"
+    match_search = re.search(r"(?:search for|find|look up)\s+(.+)", instruction, re.IGNORECASE)
+    if match_search:
+        return match_search.group(1).strip()
+    return None
+
+def _adapt_plan_from_past_task(
+    past_actions_json: str,
+    current_instruction: str,
+    past_instruction: str,
+    similarity_distance: float # Added similarity_distance
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Adapts a plan (list of actions) from a similar past task for the current instruction.
+    """
+    logging.info(f"Attempting to adapt plan (Similarity: {similarity_distance:.4f}). Current: '{current_instruction}', Past: '{past_instruction}'")
+    try:
+        past_actions = json.loads(past_actions_json)
+        # The past_actions are stored as [action_dict, success_bool, message_str, special_directive_dict_or_None]
+        # We only need the action_dict part
+        executable_past_actions = [item[0] for item in past_actions if isinstance(item, list) and len(item) > 0 and isinstance(item[0], dict)]
+    except json.JSONDecodeError as e:
+        logging.error(f"Error decoding past_actions_json: {e}")
+        return None
+
+    current_query = _extract_search_query_from_instruction(current_instruction)
+    past_query = _extract_search_query_from_instruction(past_instruction)
+
+    if not current_query or not past_query or current_query == past_query:
+        logging.info("Could not extract distinct queries or queries are identical. No adaptation performed.")
+        # If queries are the same, we might still reuse but for now, let's focus on substitution.
+        # Or, if no queries, maybe it's not a search-like task suitable for this simple adaptation.
+        return None
+    VERY_HIGH_SIMILARITY_THRESHOLD_FOR_COORDS = 0.01 # e.g., for >0.99 similarity
+    SIMILARITY_THRESHOLD_FOR_COORDINATE_CLICK = 0.1 # Stricter threshold for using coordinates
+
+    logging.info(f"Adapting based on query change: '{past_query}' -> '{current_query}'")
+    adapted_plan = []
+    stop_adaptation_and_replan = False
+
+    for action_dict in executable_past_actions:
+        if stop_adaptation_and_replan:
+            break
+
+        # Find the full past_action_tuple to get success status and message for coordinate extraction
+        original_past_action_tuple = next((item for item in past_actions if isinstance(item, list) and len(item) > 0 and item[0] == action_dict), None)
+
+        current_action_to_add = action_dict.copy() # Work with a copy
+        action_type = current_action_to_add.get("action_type")
+        params = current_action_to_add.get("parameters", {})
+        action_adapted_by_coordinate = False
+
+        # --- Adaptation logic for 'type', 'click_and_type', 'multi_action' (entity substitution) ---
+        if action_type == "type" and isinstance(params.get("text_to_type"), str) and past_query and past_query.lower() in params["text_to_type"].lower():
+            params["text_to_type"] = params["text_to_type"].lower().replace(past_query.lower(), current_query) # type: ignore
+            logging.info(f"Adapted 'type' action. New text: {params['text_to_type']}")
+        elif action_type == "click_and_type" and isinstance(params.get("text_to_type"), str) and past_query and past_query.lower() in params["text_to_type"].lower():
+            params["text_to_type"] = params["text_to_type"].lower().replace(past_query.lower(), current_query) # type: ignore
+            logging.info(f"Adapted 'click_and_type' action. New text: {params['text_to_type']}")
+        elif action_type == "multi_action" and "sequence" in params and isinstance(params["sequence"], list):
+            new_sequence = []
+            for sub_action_dict_orig in params["sequence"]:
+                sub_action_copy = sub_action_dict_orig.copy()
+                sub_params = sub_action_copy.get("parameters", {})
+                if sub_action_copy.get("action_type") == "type" and \
+                   isinstance(sub_params.get("text_to_type"), str) and \
+                   past_query and past_query.lower() in sub_params["text_to_type"].lower():
+                    sub_params["text_to_type"] = sub_params["text_to_type"].lower().replace(past_query.lower(), current_query) # type: ignore
+                    logging.info(f"Adapted 'type' within multi_action. New text: {sub_params['text_to_type']}")
+                new_sequence.append(sub_action_copy)
+            params["sequence"] = new_sequence
+        # --- End of entity substitution ---
+
+        # Heuristic: If we encounter a 'click' action that likely clicked a specific search result,
+        # or a 'describe_screen', stop adapting and let the agent plan the rest.
+        if action_type == "click":
+            element_desc_from_past = params.get("element_description", "")
+            is_content_specific_click = past_query and past_query.lower() in element_desc_from_past.lower()
+
+            can_try_coords_due_to_similarity = False
+            if similarity_distance < SIMILARITY_THRESHOLD_FOR_COORDINATE_CLICK:
+                if not is_content_specific_click:
+                    can_try_coords_due_to_similarity = True
+                elif similarity_distance < VERY_HIGH_SIMILARITY_THRESHOLD_FOR_COORDS:
+                    # For extremely similar tasks, risk using coordinates even if it seemed content-specific before,
+                    # assuming the UI layout for that specific content item is identical.
+                    logging.info(f"Very high similarity (Dist: {similarity_distance:.4f}), considering coordinate click even for potentially content-specific item: '{element_desc_from_past}'")
+                    can_try_coords_due_to_similarity = True
+            
+            if can_try_coords_due_to_similarity and \
+               original_past_action_tuple and original_past_action_tuple[1] is True and \
+               isinstance(original_past_action_tuple[2], str): # past_success and past_message is string
+                
+                past_message_for_coords = original_past_action_tuple[2]
+                coord_match = re.search(r"at \((\d+),\s*(\d+)\)", past_message_for_coords)
+                if coord_match:
+                    ex_x, ex_y = int(coord_match.group(1)), int(coord_match.group(2))
+                    # Preserve original parameters if any, then override/add x, y
+                    new_params_for_coord_click = params.copy() # Start with existing params
+                    new_params_for_coord_click["x"] = ex_x
+                    new_params_for_coord_click["y"] = ex_y
+                    if "element_description" in new_params_for_coord_click: # Remove element_description if using coords
+                        del new_params_for_coord_click["element_description"]
+                    current_action_to_add = {"action_type": "click", "parameters": new_params_for_coord_click}
+                    action_adapted_by_coordinate = True
+                    logging.info(f"Adapted 'click' to use coordinates ({ex_x},{ex_y}) from past task due to high similarity (Dist: {similarity_distance:.4f}) and non-content-specific target.")
+                else:
+                    logging.info(f"High similarity for click (Dist: {similarity_distance:.4f}), but couldn't parse coordinates from past message: '{past_message_for_coords}'")
+            
+            if not action_adapted_by_coordinate and is_content_specific_click:
+                # If we didn't adapt by coordinate (either because similarity wasn't high enough for this content-specific click,
+                # or coords couldn't be parsed) AND it's still considered a content-specific click, then stop adaptation.
+                logging.info(f"Stopping adaptation at content-specific 'click' action: {element_desc_from_past}")
+                stop_adaptation_and_replan = True
+                continue # Don't add this specific click to the adapted plan
+
+        if action_type == "describe_screen":
+            logging.info("Skipping 'describe_screen' action from past plan.")
+            continue
+
+        adapted_plan.append(current_action_to_add)
+
+    return adapted_plan if adapted_plan else None
 
 
 
@@ -449,20 +583,24 @@ def iterative_task_executor(
         llm_model = get_model()
         if llm_model is None:
             logging.error("LLM model is None and could not be initialized")
-            return
+            # Yield or raise an error to indicate failure
+            yield {"type": "error", "message": "LLM model not initialized"}
+            return [] # Return empty list or handle error appropriately
 
     # Get critic model
     critic_model = get_critic_model()
     if critic_model is None:
         logging.error("Critic model is None and could not be initialized")
-        return
+        yield {"type": "error", "message": "Critic model not initialized"}
+        return []
+
 
     results = []
     max_iterations = 25
     current_iteration = agent_state.current_task.iteration_count if agent_state.current_task else 0
     task_completed = False
     current_app_base_name = "unknown"
-    current_shortcuts = [] # This should be a string
+    current_shortcuts: Union[str, List[Dict[str, str]]] = [] # Can be string or list of dicts
     last_assessment_screenshot_hash: Optional[str] = None
     action_failure_counts: Dict[str, int] = agent_state.current_task.action_failure_counts if agent_state.current_task else {}
 
@@ -485,263 +623,211 @@ def iterative_task_executor(
     chosen_high_level_plan_description: Optional[str] = None
     current_sub_tasks: List[str] = []
     current_sub_task_index: int = 0
-
-    # Use agent_state.current_task._accumulate_tokens directly
-    # Ensure agent_state.current_task is not None before calling _accumulate_tokens
+    instruction_for_current_planning_cycle = original_instruction
+    pending_risky_action: Optional[Dict[str, Any]] = None
+    user_response_to_ask: Optional[str] = None # Initialize user_response_to_ask
 
     logging.info(f"Starting iterative execution for: {original_instruction}")
     load_shortcuts_cache()
 
-    # --- Task Analysis and Sub-tasking ---
+    # --- Attempt to use similar past task execution ---
+    if not plan_to_inject: # Only if no other plan is already injected
+        logging.info(f"Checking for similar past successful tasks for: {original_instruction}")
+        # Ensure n_results is at least 1 if collection is not empty
+        similar_past_tasks = retrieve_similar_task_executions_from_db(original_instruction, n_results=1) # type: ignore
+        if similar_past_tasks:
+            for past_task_data in similar_past_tasks:
+                past_metadata = past_task_data.get("metadata", {})
+                past_status = past_metadata.get("status")
+                past_instruction_text = past_metadata.get("original_instruction")
+                similarity_distance = past_task_data.get("distance", 1.0)
+                SIMILARITY_THRESHOLD_FOR_ADAPTATION = 0.30
+
+                if past_status == "success" and past_instruction_text and similarity_distance < SIMILARITY_THRESHOLD_FOR_ADAPTATION:
+                    logging.info(f"Found similar past successful task (Dist: {similarity_distance:.4f}): '{past_instruction_text}'. Attempting to adapt its plan.")
+                    past_actions_json_str = past_metadata.get("full_results_json")
+                    if past_actions_json_str:
+                        adapted_plan = _adapt_plan_from_past_task(past_actions_json_str, original_instruction, past_instruction_text, similarity_distance) # type: ignore
+                        if adapted_plan:
+                            plan_to_inject = adapted_plan
+                            plan_injection_reason = f"Adapted from similar past task (Dist: {similarity_distance:.4f}): '{past_instruction_text}'"
+                            print(f"\n{BLUE}=== Using Adapted Plan from Past Task ===")
+                            print(f"Current Task: '{original_instruction}'")
+                            print(f"Adapted from: '{past_instruction_text}' (Similarity Distance: {similarity_distance:.4f})")
+                            print(f"Adapted Actions ({len(adapted_plan)} steps):{RESET}")
+                            for i, action in enumerate(adapted_plan):
+                                print(f"  {i+1}. {action.get('action_type')}: {action.get('parameters')}")
+                            print(f"{BLUE}======================================{RESET}\n")
+                            logging.info(f"Injecting adapted plan with {len(plan_to_inject)} steps.")
+                            break
     if agent_state.current_task and current_iteration == 0 and not agent_state.current_task.initial_planning_done:
-        # Check if sub_tasks are already populated (e.g., from a resumed task)
-        if hasattr(agent_state.current_task, 'sub_tasks') and agent_state.current_task.sub_tasks: # type: ignore
-            current_sub_tasks = agent_state.current_task.sub_tasks # type: ignore
-            current_sub_task_index = agent_state.current_task.current_sub_task_index # type: ignore
+        if hasattr(agent_state.current_task, 'sub_tasks') and agent_state.current_task.sub_tasks:
+            current_sub_tasks = agent_state.current_task.sub_tasks
+            current_sub_task_index = agent_state.current_task.current_sub_task_index
             logging.info(f"Resuming with existing sub-tasks. Current: {current_sub_task_index + 1}/{len(current_sub_tasks)}")
         else:
-            category, sub_tasks_list, analysis_reasoning, analysis_tokens = _analyze_and_categorize_task(original_instruction, llm_model)
+            category, sub_tasks_list, analysis_reasoning, analysis_tokens = _analyze_and_categorize_task(original_instruction, llm_model) # type: ignore
             if agent_state.current_task: agent_state.current_task._accumulate_tokens(analysis_tokens)
-
             agent_state.add_thought(f"Task Analysis: Category='{category}', Sub-tasks={len(sub_tasks_list)}. Reasoning: {analysis_reasoning}", type="task_analysis")
-
             if category and sub_tasks_list:
                 current_sub_tasks = sub_tasks_list
                 current_sub_task_index = 0
-                # Store in agent_state.current_task if these attributes are added to TaskSession
-                if hasattr(agent_state.current_task, 'sub_tasks'): agent_state.current_task.sub_tasks = current_sub_tasks # type: ignore
-                if hasattr(agent_state.current_task, 'current_sub_task_index'): agent_state.current_task.current_sub_task_index = current_sub_task_index # type: ignore
-                if hasattr(agent_state.current_task, 'task_category'): agent_state.current_task.task_category = category # type: ignore
+                if hasattr(agent_state.current_task, 'sub_tasks'): agent_state.current_task.sub_tasks = current_sub_tasks
+                if hasattr(agent_state.current_task, 'current_sub_task_index'): agent_state.current_task.current_sub_task_index = current_sub_task_index
+                if hasattr(agent_state.current_task, 'task_category'): agent_state.current_task.task_category = category
                 logging.info(f"Task broken down into {len(current_sub_tasks)} sub-tasks.")
             else:
-                current_sub_tasks = [original_instruction] # Treat original instruction as the only sub-task
-
-        similar_user_task = find_similar_user_task_structure(current_task_instruction)
-        if similar_user_task:
-            executed_actions_summary_parts_initial = []
-            if results: 
-                for i, (action_dict, success, msg, _) in reversed(list(enumerate(results[-5:]))): 
-                    action_type = action_dict.get('action_type', 'Unknown')
-                    _ = str(action_dict.get('parameters', {})) # params_str not used
-                    outcome = "OK" if success else "FAIL"
-                    exec_msg_only = msg.split("| Assessment:")[0].strip()
-                    summary_line = f"  Prev. Action {len(results) - i}: {action_type}, Outcome: {outcome} - Msg: {exec_msg_only[:70]}{'...' if len(exec_msg_only)>70 else ''}"
-                    executed_actions_summary_parts_initial.append(summary_line)
-            _ = "\n".join(executed_actions_summary_parts_initial) if executed_actions_summary_parts_initial else "No actions executed yet in this task." # executed_actions_summary_str_initial not used
-
-            task_name = similar_user_task.get('task_name', 'Unnamed Task')
-            ask_question = (
-                f"I found a saved task structure named '{task_name}' that seems similar to your request. "
-                "Would you like me to use your saved plan for this task instead of figuring it out? (Type 'yes' to use saved plan, 'no' to use standard planning)"
-            )
-            ask_action = {"action_type": "ask_user", "parameters": {"question": ask_question}}
-            current_iteration += 1
-            agent_state.add_thought(f"Iteration {current_iteration}/{max_iterations} (User Plan Suggestion): Asking user about saved task '{task_name}'.")
-
-            yield_result = {"type": "ask_user", "question": ask_question} 
-            user_response_to_ask = yield yield_result
-
-            if user_response_to_ask is None:
-                logging.warning(
-                    "Generator received None when expecting input for user plan suggestion. "
-                    "Treating as 'no' or proceeding with standard planning."
-                )
-                user_response_to_ask = "no"
-
-            results.append((ask_action, True, f"Asked user about saved plan. Response: '{user_response_to_ask}'", None))
-            if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "user", "content": user_response_to_ask})
-
-            if "yes" in user_response_to_ask.lower():
-                logging.info(f"User chose to use saved plan '{task_name}'. Injecting plan.")
-                try:
-                    plan_text_from_user = similar_user_task.get('plan_text', '')
-                    if plan_text_from_user:
-                        logging.info(f"Using user-defined plan text as new instruction for '{task_name}':\n{plan_text_from_user}")
-                        current_task_instruction = plan_text_from_user
-                        plan_source = f"User Defined Plan: {task_name}"
-                        user_plan_used = True
-
-                        inform_message = f"Okay, I will follow your saved instructions for '{task_name}': \"{plan_text_from_user}\"."
-                        if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "assistant", "content": inform_message})
-                        yield {"type": "inform_user", "message": inform_message}
-                    else:
-                        logging.warning(f"User-defined plan text for '{task_name}' is empty. Falling back to standard planning.")
-                        if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "assistant", "content": f"Saved plan for '{task_name}' is empty. Proceeding with standard planning."})
-                        plan_source = "Standard Planning"
-                        user_plan_used = False
-
-                    if not user_plan_used:
-                        if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "assistant", "content": f"Could not use saved plan '{task_name}' (format issue or empty). Proceeding with standard planning."})
-                        plan_source = "Standard Planning"
-                except Exception as e_load_user_plan:
-                    logging.error(f"Unexpected error processing user-defined plan '{task_name}': {e_load_user_plan}", exc_info=True)
-                    if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "assistant", "content": f"Error decoding saved plan '{task_name}'. Proceeding with standard planning."})
-                    plan_source = "Standard Planning"
-            else:
-                agent_state.add_thought(f"User declined saved plan '{task_name}'. Proceeding with standard planning.")
-                plan_source = "Standard Planning"
-
-        if not user_plan_used:
-            complex_keywords = ["create", "build", "set up", "install", "configure", "pipeline", "system", "server", "database", "analyze", "summarize", "generate code", "translate", "design", "write code", "visual charts"]
-            is_complex_task = any(keyword in current_task_instruction.lower() for keyword in complex_keywords)
-
-            if is_complex_task:
-                logging.info("Instruction seems complex. Searching for AI services.")
-                plan_source = "AI Service Search" 
-                search_success, search_summary, search_tokens = search_web_for_info(f"AI service for {current_task_instruction}")
-                if agent_state.current_task: agent_state.current_task._accumulate_tokens(search_tokens)
-                if search_success and search_summary and len(search_summary) > 30:
-                    if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "assistant", "content": f"System: Searched web for AI services. Found: {search_summary[:100]}..."})
-                    ask_question_intro = (
-                        f"For your task: '{current_task_instruction}', I've looked into AI tools. "
-                        "Here's a summary of what I found (this might include multiple tools, their features, and mentions of free/paid plans if available):\n\n"
-                        f"\"{search_summary}\"\n\n"
-                    )
-                    ask_question_options = (
-                        "Based on this, what would you like to do?\n"
-                        "1. Try to use an AI tool mentioned above? (If so, please specify which tool if multiple are mentioned, e.g., 'use ToolName')\n"
-                        "2. Search the web for detailed step-by-step instructions for this task?\n"
-                        "3. Let me try to accomplish this task directly (e.g., by writing a script or using standard methods)?\n"
-                        "Please type your choice (e.g., 'use ToolName', 'search web steps', 'do it myself')."
-                    )
-                    ask_question = ask_question_intro + ask_question_options
-                    ask_action = {"action_type": "ask_user", "parameters": {"question": ask_question}}
-                    agent_state.add_thought(f"Iteration {current_iteration}/{max_iterations} (AI Service Query): Asking user about AI tools.")
-                    yield_result = {"type": "ask_user", "question": ask_question}
-                    user_response_to_ask = yield yield_result
-
-                    if user_response_to_ask is None:
-                        logging.warning(
-                            "Generator received None when expecting input for AI service query. "
-                            "Defaulting to standard planning."
-                        )
-                        user_response_to_ask = "do it myself"
-
-                    results.append((ask_action, True, f"Asked user about AI service. Response: '{user_response_to_ask}'", None))
-
-                    response_lower = user_response_to_ask.lower()
-                    if response_lower.startswith("use ") and len(user_response_to_ask.split()) > 1:
-                        chosen_tool_name = user_response_to_ask.split(" ", 1)[1].strip()
-                        if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "assistant", "content": f"Okay, I will try to use the AI tool: '{chosen_tool_name}'."})
-                        plan_source = f"AI Service Plan - Tool: {chosen_tool_name}"
-                    elif "search web steps" in response_lower:
-                        if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "assistant", "content": "Okay, I will search the web for detailed steps."})
-                        plan_source = "Web Search Suggestion"
-                    elif "do it myself" in response_lower or "figure it out" in response_lower:
-                        if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "assistant", "content": "Okay, I will proceed with standard planning."})
-                        plan_source = "Standard Planning"
-                    else:
-                        if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "assistant", "content": f"Your response ('{user_response_to_ask}') was unclear. Defaulting to standard planning."})
-                        plan_source = "Standard Planning"
-                else:
-                    if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "assistant", "content": f"System: No specific AI services found for '{current_task_instruction}'. Will try general web search or standard planning."})
-                    plan_source = "Web Search Suggestion"
-
-            if plan_source == "Web Search Suggestion" and not user_plan_used:
-                logging.info("Searching web for general plan steps.")
-                search_success, search_summary, search_tokens = search_web_for_info(f"steps to {current_task_instruction}")
-                if agent_state.current_task: agent_state.current_task._accumulate_tokens(search_tokens)
-                if search_success and search_summary and len(search_summary) > 50:
-                    if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "assistant", "content": f"System: Searched web for general steps. Found: {search_summary[:100]}..."})
-                    ask_question = (
-                        f"I found some general steps online for '{current_task_instruction}':\n\n"
-                        f"{search_summary}\n\n"
-                        "Follow these steps or figure it out? (Type 'follow steps' or 'figure it out')"
-                    )
-                    ask_action = {"action_type": "ask_user", "parameters": {"question": ask_question}}
-                    current_iteration += 1
-                    agent_state.add_thought(f"Iteration {current_iteration}/{max_iterations} (General Web Plan Query): Asking user about web steps.")
-                    yield_result = {"type": "ask_user", "question": ask_question}
-                    user_response_to_ask = yield yield_result
-
-                    if user_response_to_ask is None:
-                        logging.warning(
-                            "Generator received None when expecting input for general web plan query. "
-                            "Defaulting to 'figure it out'."
-                        )
-                        user_response_to_ask = "figure it out"
-
-                    results.append((ask_action, True, f"Asked user about general web plan. Response: '{user_response_to_ask}'", None))
-                    if "follow steps" in user_response_to_ask.lower():
-                        if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "assistant", "content": "System: User chose to follow general web steps."})
-                        plan_source = "Web Search Plan"
-                    else:
-                        if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "assistant", "content": "System: User chose standard planning."})
-                        plan_source = "Standard Planning"
-                else:
-                    if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "assistant", "content": "System: General web search did not yield useful results. Proceeding with standard planning."})
-                    plan_source = "Standard Planning"
-            elif not user_plan_used and plan_source not in ["AI Service Plan", "Web Search Suggestion", "Web Search Plan"]: # type: ignore
-                plan_source = "Standard Planning"
+                current_sub_tasks = [original_instruction]
         if agent_state.current_task: agent_state.current_task.initial_planning_done = True
 
-    # Determine the current instruction for this iteration (either a sub-task or the original)
-    if current_sub_tasks and 0 <= current_sub_task_index < len(current_sub_tasks):
-        instruction_for_current_planning_cycle = current_sub_tasks[current_sub_task_index]
-        agent_state.add_thought(f"Working on Sub-task {current_sub_task_index + 1}/{len(current_sub_tasks)}: {instruction_for_current_planning_cycle}", type="sub_task_info")
-    else:
-        instruction_for_current_planning_cycle = original_instruction
-
-    # --- Check for user-defined structure for the current sub-task (if it's a sub-task) ---
-    if current_sub_tasks and 0 <= current_sub_task_index < len(current_sub_tasks) and instruction_for_current_planning_cycle != original_instruction:
-        logging.info(f"Checking for user-defined structures for sub-task: {instruction_for_current_planning_cycle}")
-        similar_sub_task_structure = find_similar_user_task_structure(instruction_for_current_planning_cycle)
-        if similar_sub_task_structure:
-            sub_task_structure_name = similar_sub_task_structure.get('task_name', 'Unnamed Sub-Task Structure')
-            ask_sub_task_question = (
-                f"For the current sub-task '{instruction_for_current_planning_cycle}', "
-                f"I found a saved task structure named '{sub_task_structure_name}'. "
-                "Would you like to use its plan text to guide this sub-task? (Type 'yes' or 'no')"
-            )
-            ask_sub_task_action = {"action_type": "ask_user", "parameters": {"question": ask_sub_task_question}}
-            yield_sub_task_result = {"type": "ask_user", "question": ask_sub_task_question}
-            user_response_to_sub_task_ask = yield yield_sub_task_result
-
-            if user_response_to_sub_task_ask is None: user_response_to_sub_task_ask = "no"
-            results.append((ask_sub_task_action, True, f"Asked user about saved structure for sub-task. Response: '{user_response_to_sub_task_ask}'", None))
-            if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "user", "content": user_response_to_sub_task_ask})
-
-            if "yes" in user_response_to_sub_task_ask.lower():
-                sub_task_plan_text = similar_sub_task_structure.get('plan_text', '')
-                if sub_task_plan_text:
-                    logging.info(f"User chose to use saved structure '{sub_task_structure_name}' for sub-task. New instruction for sub-task: {sub_task_plan_text}")
-                    instruction_for_current_planning_cycle = sub_task_plan_text # Update the instruction for this cycle
-                    agent_state.add_thought(f"Using user-defined structure '{sub_task_structure_name}' for sub-task '{current_sub_tasks[current_sub_task_index]}'.", type="sub_task_planning")
-                else:
-                    logging.warning(f"Saved structure '{sub_task_structure_name}' for sub-task is empty. Proceeding with original sub-task description.")
-            else:
-                logging.info(f"User declined saved structure for sub-task. Proceeding with original sub-task description.")
-    # instruction_for_current_planning_cycle = original_instruction # This was a bug, should not reset here
-
     while current_iteration < max_iterations and not task_completed:
+        action_to_execute = None # Initialize action_to_execute at the start of each iteration
+
+        if current_sub_tasks and 0 <= current_sub_task_index < len(current_sub_tasks):
+            instruction_for_current_planning_cycle = current_sub_tasks[current_sub_task_index]
+            if not agent_state.current_task or not any(
+                thought['type'] == 'sub_task_info' and
+                thought['content'].startswith(f"Working on Sub-task {current_sub_task_index + 1}")
+                for thought in agent_state.current_task.agent_thoughts[-3:] # type: ignore
+            ):
+                agent_state.add_thought(f"Working on Sub-task {current_sub_task_index + 1}/{len(current_sub_tasks)}: {instruction_for_current_planning_cycle}", type="sub_task_info")
+        else:
+            instruction_for_current_planning_cycle = current_task_instruction
+
+        if current_sub_tasks and 0 <= current_sub_task_index < len(current_sub_tasks) and not plan_to_inject :
+            sub_task_instruction_lower = instruction_for_current_planning_cycle.lower()
+            required_context_marker = None
+            action_to_re_establish_if_lost = None
+
+            if "youtube" in sub_task_instruction_lower or "video" in sub_task_instruction_lower:
+                required_context_marker = "youtube"
+                action_to_re_establish_if_lost = {"action_type": "navigate_web", "parameters": {"url": "https://www.youtube.com"}}
+            elif "notepad" in sub_task_instruction_lower:
+                required_context_marker = "notepad.exe"
+                action_to_re_establish_if_lost = {"action_type": "run_shell_command", "parameters": {"command": "notepad.exe"}}
+
+            if required_context_marker:
+                active_window_title_for_check = get_active_window_name().lower()
+                active_app_base_name_for_check = get_base_app_name(active_window_title_for_check)
+                context_match = False
+                known_browsers_bases = ["chrome", "firefox", "msedge", "brave"]
+
+                if ".exe" in required_context_marker:
+                    if required_context_marker == active_app_base_name_for_check:
+                        context_match = True
+                elif any(browser_base in active_app_base_name_for_check for browser_base in known_browsers_bases) and \
+                     required_context_marker in active_window_title_for_check:
+                    context_match = True
+                
+                if not context_match:
+                    log_message = f"Context mismatch for sub-task '{instruction_for_current_planning_cycle}'. Expected context related to '{required_context_marker}', but active window is '{active_window_title_for_check}' (Base app: '{active_app_base_name_for_check}')."
+                    was_recently_in_context = False
+                    if agent_state.current_task:
+                        original_full_context_for_history = "youtube.com" if required_context_marker == "youtube" else required_context_marker
+                        for msg in reversed(agent_state.current_task.conversation_history[-3:]):
+                            if msg["role"] == "system" and "content" in msg:
+                                if original_full_context_for_history in msg["content"].lower():
+                                    was_recently_in_context = True
+                                    break
+                    if was_recently_in_context:
+                        log_message += " However, required context was recently observed in history. Planner should attempt to focus correct window."
+                        logging.warning(log_message)
+                    elif action_to_re_establish_if_lost:
+                        log_message += f" Attempting to re-establish context by injecting plan: {action_to_re_establish_if_lost}."
+                        logging.warning(log_message)
+                        plan_to_inject = [action_to_re_establish_if_lost]
+                        plan_injection_reason = f"Re-establishing context '{required_context_marker}' (was lost) for sub-task {current_sub_task_index + 1}"
+                        agent_state.add_thought(f"Injecting plan to re-establish context: {plan_injection_reason}", type="context_fix")
+                    else:
+                        log_message += " No specific action defined to re-establish this context if lost and not recently in history."
+                        logging.error(log_message)
 
         while agent_state.task_is_paused:
+            if pending_risky_action and user_response_to_ask is not None:
+                confirmed_command_str = pending_risky_action.get("parameters", {}).get("command", "Unknown command")
+                if "yes" in user_response_to_ask.lower():
+                    logging.info(f"User confirmed risky command: {confirmed_command_str}")
+                    action_to_execute = pending_risky_action.copy()
+                    action_to_execute["_bypass_confirmation_"] = True
+                    if agent_state.current_task:
+                        agent_state.current_task.conversation_history.append({"role": "system", "content": f"System: User confirmed execution of risky command '{confirmed_command_str}'."})
+                    pending_risky_action = None
+                    user_response_to_ask = None
+                else:
+                    logging.warning(f"User denied risky command: {confirmed_command_str}")
+                    results.append((pending_risky_action, False, f"User denied risky command execution: {confirmed_command_str}", None))
+                    if agent_state.current_task:
+                        agent_state.current_task.conversation_history.append({"role": "system", "content": f"System: User denied execution of risky command '{confirmed_command_str}'."})
+                    pending_risky_action = None
+                    user_response_to_ask = None
+                    total_consecutive_failures = 0
+                    consecutive_failures_on_current_step = 0
+                    replan_attempts_current_cycle = 0
+                    current_iteration +=1
+                    if agent_state.current_task: agent_state.current_task.iteration_count = current_iteration
+                    logging.info(f"--- Iteration {current_iteration}/{max_iterations} (User Denied Risky Command) ---")
+                    continue
+            elif pending_risky_action and user_response_to_ask is None:
+                logging.warning("Resumed from pause but pending_risky_action exists and user_response_to_ask is None. This might be an issue.")
             logging.debug("Generator: Task is paused. Yielding 'paused' state.")
             yield {"type": "paused"}
             logging.debug("Generator: Resuming from pause check.")
+        
         current_iteration += 1
         if agent_state.current_task: agent_state.current_task.iteration_count = current_iteration
         logging.info(f"--- Iteration {current_iteration}/{max_iterations} (Plan Source: {plan_source}, Consecutive Failures: {total_consecutive_failures}, Replans: {replan_attempts_current_cycle}) ---")
+        logging.info(f"Current planning cycle instruction: '{instruction_for_current_planning_cycle}'")
 
-        if plan_to_inject is not None:
-            logging.info(f"Injecting new plan (reason: {plan_injection_reason}, {len(plan_to_inject)} steps).")
-            if not plan_to_inject:
-                logging.warning("Injected plan was empty. Continuing normal planning.")
-                plan_to_inject = None; plan_injection_reason = None
-
+        if not action_to_execute:
+            if plan_to_inject is not None:
+                logging.info(f"Injecting new plan (reason: {plan_injection_reason}, {len(plan_to_inject)} steps).")
+                if not plan_to_inject:
+                    logging.warning("Injected plan was empty or exhausted. Continuing normal planning.")
+                    plan_to_inject = None
+                    plan_injection_reason = None
+        
         try:
             full_app_name = get_active_window_name()
             app_base_name = get_base_app_name(full_app_name)
+            name_for_shortcuts_lookup = app_base_name
+            is_website_shortcut_lookup = False
+            known_browsers_bases_exec = ["chrome.exe", "firefox.exe", "msedge.exe", "brave.exe"]
+
+            if app_base_name.lower() in known_browsers_bases_exec:
+                if agent_state.current_task and agent_state.current_task.conversation_history:
+                    for msg in reversed(agent_state.current_task.conversation_history[-5:]):
+                        if msg["role"] == "system" and "content" in msg and "System Observation: Opened web URL:" in msg["content"]:
+                            url_match = re.search(r"Opened web URL:\s*(https?://[^/\s]+)", msg["content"])
+                            if url_match:
+                                full_url = url_match.group(1)
+                                domain_match = re.search(r"https?://(?:www\.)?([^/]+)", full_url)
+                                if domain_match:
+                                    domain = domain_match.group(1)
+                                    name_for_shortcuts_lookup = domain
+                                    logging.info(f"Browser '{app_base_name}' is active. Identified active website '{domain}' from history. Will fetch shortcuts for '{domain}'.")
+                                    is_website_shortcut_lookup = True
+                                    break
+                    else:
+                        logging.info(f"Browser '{app_base_name}' is active, but no recent 'Opened web URL' found in history. Using browser name for shortcuts.")
+                else:
+                    logging.info(f"Browser '{app_base_name}' is active, but no conversation history to check for URLs. Using browser name for shortcuts.")
+
             if app_base_name != current_app_base_name:
-                logging.info(f"Application context changed to: {app_base_name}")
+                logging.info(f"Application context changed. Old: '{current_app_base_name}', New: '{app_base_name}', Full title: '{full_app_name}'. Shortcut lookup term: '{name_for_shortcuts_lookup}'")
                 current_app_base_name = app_base_name
-                current_shortcuts_str, shortcut_tokens = get_application_shortcuts(current_app_base_name) # Capture tokens
-                current_shortcuts = current_shortcuts_str # Assign string to current_shortcuts
+                current_shortcuts_str, shortcut_tokens = get_application_shortcuts(name_for_shortcuts_lookup) # type: ignore
+                current_shortcuts = current_shortcuts_str # type: ignore
+                if current_shortcuts_str and current_shortcuts_str.strip(): # type: ignore
+                    from config import GREEN, RESET
+                    logging.info(f"{GREEN}Using shortcuts for '{name_for_shortcuts_lookup}':\n{current_shortcuts_str}{RESET}") # type: ignore
                 if agent_state.current_task: agent_state.current_task._accumulate_tokens(shortcut_tokens)
-                if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "system", "content": f"System Observation: Active application changed to '{app_base_name}'."})
+                if is_website_shortcut_lookup:
+                    from config import YELLOW, RESET
+                    logging.info(f"{YELLOW}Fetching shortcuts for WEBSITE: {name_for_shortcuts_lookup}{RESET}")
+                if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "system", "content": f"System Observation: Active application changed to '{app_base_name}' (Window: '{full_app_name}')."})
         except Exception as app_detect_err:
             logging.error(f"Error during application detection/shortcut handling: {app_detect_err}", exc_info=True)
-            current_app_base_name = "unknown"; current_shortcuts = "" # Ensure current_shortcuts is a string
+            current_app_base_name = "unknown"; current_shortcuts = ""
 
         planning_screenshot = capture_full_screen()
         screenshot_before_action_hash = _hash_pil_image(planning_screenshot)
@@ -750,323 +836,179 @@ def iterative_task_executor(
             logging.info("Detected screen change since last assessment.")
             if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "system", "content": "System Observation: Screen content changed since last action."})
 
-        action_to_execute = None
+        # action_to_execute = None # This was moved to the top of the loop
         planning_reasoning = "Planning skipped due to pending credential request or injected plan."
+        next_step_data = None
 
-        if chosen_high_level_plan_description:
-            logging.info(f"Using chosen high-level plan description for detailed planning: {chosen_high_level_plan_description[:200]}...")
-            instruction_for_current_planning_cycle = chosen_high_level_plan_description
-            plan_source = "Detailed planning of chosen high-level path"
-            chosen_high_level_plan_description = None
+        if not action_to_execute:
+            if chosen_high_level_plan_description:
+                logging.info(f"Using chosen high-level plan description for detailed planning: {chosen_high_level_plan_description[:200]}...")
+                instruction_for_current_planning_cycle = chosen_high_level_plan_description
+                plan_source = "Detailed planning of chosen high-level path"
+                chosen_high_level_plan_description = None
 
+            if plan_to_inject:
+                action_to_execute = plan_to_inject.pop(0)
+                planning_reasoning = f"Executing step from injected plan (original reason: {plan_injection_reason})"
+                if not plan_to_inject:
+                    plan_to_inject = None
+                    plan_injection_reason = None
+                logging.info(f"Using action from injected plan: {action_to_execute.get('action_type') if isinstance(action_to_execute, dict) else 'Invalid injected action'}")
+            else:
+                string_history_for_planning = [f"{msg['role']}: {msg['content']}" for msg in (agent_state.current_task.conversation_history if agent_state.current_task else [])]
+                executed_actions_summary_parts = []
+                if results:
+                    for i, (action_dict_res, success_res, msg_res, _) in reversed(list(enumerate(results[-5:]))):
+                        action_type_res = action_dict_res.get('action_type', 'Unknown')
+                        outcome_res = "OK" if success_res else "FAIL"
+                        exec_msg_only_res = msg_res.split("| Assessment:")[0].strip()
+                        summary_line = f"  Prev. Action {len(results) - i}: {action_type_res}, Outcome: {outcome_res} - Msg: {exec_msg_only_res[:70]}{'...' if len(exec_msg_only_res)>70 else ''}"
+                        executed_actions_summary_parts.append(summary_line)
+                executed_actions_summary_str_for_prompt = "\n".join(executed_actions_summary_parts) if executed_actions_summary_parts else "No actions executed yet in this task."
 
-        if plan_to_inject:
-            action_to_execute = plan_to_inject.pop(0)
-            planning_reasoning = f"Executing step from injected plan (original reason: {plan_injection_reason})"
-            if not plan_to_inject:
-                plan_to_inject = None
-                plan_injection_reason = None
-            logging.info(f"Using action from injected plan: {action_to_execute.get('action_type') if isinstance(action_to_execute, dict) else 'Invalid injected action'}")
-        else:
-            string_history_for_planning = [f"{msg['role']}: {msg['content']}" for msg in (agent_state.current_task.conversation_history if agent_state.current_task else [])]
+                next_step_data, planning_tokens = process_next_step(
+                    instruction_for_current_planning_cycle,
+                    string_history_for_planning,
+                    llm_model,
+                    current_shortcuts, # type: ignore
+                    [],
+                    planning_screenshot,
+                    executed_actions_summary=executed_actions_summary_str_for_prompt,
+                    overall_original_instruction=original_instruction,
+                    all_sub_tasks_count=len(current_sub_tasks) if current_sub_tasks else 0,
+                    current_sub_task_idx=current_sub_task_index if current_sub_tasks else -1
+                )
+                if agent_state.current_task: agent_state.current_task._accumulate_tokens(planning_tokens)
+                if next_step_data is None or "next_action" not in next_step_data or not isinstance(next_step_data["next_action"], dict):
+                    reason = f"Planning failed: Invalid or no 'next_action' from process_next_step: {next_step_data}"
+                    logging.error(reason)
+                    results.append((({'action_type': 'STOP', 'parameters': {'reason': 'planning_failed_structure'}}, False, reason, None)))
+                    break
+                action_to_execute = next_step_data["next_action"]
+                planning_reasoning = next_step_data.get("reasoning", "N/A")
 
-            executed_actions_summary_parts = []
-            if results: 
-                for i, (action_dict, success, msg, _) in reversed(list(enumerate(results[-5:]))):
-                    action_type = action_dict.get('action_type', 'Unknown')
-                    outcome = "OK" if success else "FAIL"
-                    exec_msg_only = msg.split("| Assessment:")[0].strip() 
-                    summary_line = f"  Prev. Action {len(results) - i}: {action_type}, Outcome: {outcome} - Msg: {exec_msg_only[:70]}{'...' if len(exec_msg_only)>70 else ''}"
-                    executed_actions_summary_parts.append(summary_line)
-            executed_actions_summary_str_for_prompt = "\n".join(executed_actions_summary_parts) if executed_actions_summary_parts else "No actions executed yet in this task."
-
-            next_step_data, planning_tokens = process_next_step(
-                instruction_for_current_planning_cycle,
-                string_history_for_planning,
-                llm_model,
-                current_shortcuts, # Pass the string here
-                [], # current_reinforcements - assuming this is handled by the prompt
-                planning_screenshot,
-                executed_actions_summary=executed_actions_summary_str_for_prompt
-            )
-            if agent_state.current_task: agent_state.current_task._accumulate_tokens(planning_tokens)
-            if next_step_data is None or "next_action" not in next_step_data or not isinstance(next_step_data["next_action"], dict):
-                reason = f"Planning failed: Invalid or no 'next_action' from process_next_step: {next_step_data}"
-                logging.error(reason)
-                results.append((({'action_type': 'STOP', 'parameters': {'reason': 'planning_failed_structure'}}, False, reason, None)))
-                break
-            action_to_execute = next_step_data["next_action"]
-            planning_reasoning = next_step_data.get("reasoning", "N/A")
-
-        action_type = action_to_execute.get("action_type")
-        params = action_to_execute.get("parameters", {})
+        action_type = action_to_execute.get("action_type") # type: ignore
+        params = action_to_execute.get("parameters", {}) # type: ignore
         logging.info(f"Proposed Action: {action_type}. Reasoning: {planning_reasoning}")
-        # agent_state.add_thought(f"Iteration {current_iteration}: Proposed Action: {action_type}, Params: {params}, Reasoning: {planning_reasoning}", type="planning")
+
+        if action_type == "refresh_application_shortcuts":
+            logging.info(f"Executing special action: refresh_application_shortcuts for '{name_for_shortcuts_lookup}'") # type: ignore
+            current_shortcuts_str, shortcut_tokens = get_application_shortcuts(name_for_shortcuts_lookup, force_refresh=True) # type: ignore
+            current_shortcuts = current_shortcuts_str # type: ignore
+            if agent_state.current_task: agent_state.current_task._accumulate_tokens(shortcut_tokens)
+            refresh_message = f"Application shortcuts for '{name_for_shortcuts_lookup}' have been refreshed." # type: ignore
+            if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "system", "content": f"System Observation: {refresh_message}"})
+            results.append(((action_to_execute, True, refresh_message, {"type": "shortcuts_refreshed", "token_usage": shortcut_tokens}))) # type: ignore
+            logging.info(refresh_message + " Continuing to next planning cycle.")
+            total_consecutive_failures = 0; consecutive_failures_on_current_step = 0; replan_attempts_current_cycle = 0
+            action_to_execute = None
+            continue
         
-        # Store the raw plan JSON as the thought content for planning
-        if next_step_data and isinstance(next_step_data, dict):
-            thought_content_json_str = json.dumps(next_step_data)
-            agent_state.add_thought(thought_content_json_str, type="planning_json") # Use a distinct type
-        else:
-            agent_state.add_thought(f"Iteration {current_iteration}: Planning data not in expected format. Reasoning: {planning_reasoning}", type="planning_error")
+        if not action_to_execute.get("_bypass_confirmation_"): # type: ignore
+            if next_step_data and isinstance(next_step_data, dict):
+                thought_content_json_str = json.dumps(next_step_data)
+                agent_state.add_thought(thought_content_json_str, type="planning_json")
+        elif not next_step_data :
+            agent_state.add_thought(f"Iteration {current_iteration}: Plan was injected. Action: {action_type}, Params: {params}. Original Injection Reason: {plan_injection_reason}", type="planning_info")
 
         critique_passed = True
         critique_feedback = "Critique skipped for credential value request or injected plan."
         if not (pending_credential_request and credential_consent_choice in ['onetime', 'remember']) and not plan_injection_reason:
             critique_screenshot = planning_screenshot
             string_history_for_critique = [f"{msg['role']}: {msg['content']}" for msg in (agent_state.current_task.conversation_history if agent_state.current_task else [])]
-            logging.info(f"About to call critique_action with critic_model: {critic_model}")
-            critique_passed, critique_feedback, critique_tokens = critique_action(
-                instruction_for_current_planning_cycle, string_history_for_critique, action_to_execute, critic_model, critique_screenshot # type: ignore
-            )
-            if agent_state.current_task: agent_state.current_task._accumulate_tokens(critique_tokens)
-            if not critique_passed:
-                if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "system", "content": f"System: Proposed action {action_type} critiqued: {critique_feedback}. Reconsidering."})
-                results.append((({'action_type': 'CRITIQUE_FAILED', 'parameters': {'failed_action': action_type}}, False, f"Critique failed: {critique_feedback}", None)))
-                total_consecutive_failures = 0
-                consecutive_failures_on_current_step = 0
-                replan_attempts_current_cycle = 0
-                if pending_credential_request and not credential_consent_choice:
-                    pending_credential_request = None
-                continue
+            if not action_to_execute.get("_bypass_confirmation_"): # type: ignore
+                logging.info(f"About to call critique_action with critic_model: {critic_model}")
+                critique_passed, critique_feedback, critique_tokens = critique_action(
+                    instruction_for_current_planning_cycle, string_history_for_critique, action_to_execute, critic_model, critique_screenshot # type: ignore
+                )
+                if agent_state.current_task: agent_state.current_task._accumulate_tokens(critique_tokens)
+                if not critique_passed:
+                    if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "system", "content": f"System: Proposed action {action_type} critiqued: {critique_feedback}. Reconsidering."})
+                    results.append((({'action_type': 'CRITIQUE_FAILED', 'parameters': {'failed_action': action_type}}, False, f"Critique failed: {critique_feedback}", None)))
+                    total_consecutive_failures = 0
+                    consecutive_failures_on_current_step = 0
+                    replan_attempts_current_cycle = 0
+                    if pending_credential_request and not credential_consent_choice:
+                        pending_credential_request = None
+                    continue
 
+        is_legitimate_overall_completion_check_for_action = False
         if action_type == "task_complete":
-            task_completed = True
-            results.append(((action_to_execute, True, f"Task completed. Reason: {planning_reasoning}", None)))
-            break
+            is_legitimate_overall_completion_check_for_action = not current_sub_tasks or \
+                                               (current_sub_tasks and current_sub_task_index == len(current_sub_tasks) - 1)
+            if is_legitimate_overall_completion_check_for_action:
+                task_completed = True
+                logging.info(f"LLM planned 'task_complete' for the last/only sub-task. Flagging task as complete. Reason: {planning_reasoning}")
+            else:
+                logging.info(f"LLM planned 'task_complete' for sub-task {current_sub_task_index + 1}/{len(current_sub_tasks)} (not the last). Treating as current sub-task success signal.")
+        
+        exec_result = execute_action(action_to_execute, agent) # type: ignore
+        exec_success = False; exec_message = "Execution error"; special_directive = None
+        if isinstance(exec_result, tuple) and len(exec_result) == 3 and exec_result[0] == -2: exec_result = (True, exec_result[1], exec_result[2]) # type: ignore
+        if isinstance(exec_result, tuple) and len(exec_result) == 3: exec_success, exec_message, special_directive = exec_result # type: ignore
+        elif isinstance(exec_result, tuple) and len(exec_result) == 2: 
+            exec_success, exec_message = exec_result # type: ignore
+            special_directive = None
 
-        exec_result = execute_action(action_to_execute, agent)
-
-        exec_success = False
-        exec_message = "Execution result processing error."
-        special_directive = None
-
-        if isinstance(exec_result, tuple) and len(exec_result) == 3 and exec_result[0] == -2: # type: ignore
-            _, exec_message, ask_info = exec_result # type: ignore
-            exec_result = (True, exec_message, ask_info) # type: ignore
-
-        if isinstance(exec_result, tuple) and len(exec_result) == 3:
-            exec_success, exec_message, special_directive = exec_result # type: ignore
-            directive_type = special_directive.get("type") if isinstance(special_directive, dict) else None
+        if special_directive and isinstance(special_directive, dict):
+            directive_type = special_directive.get("type")
+            if exec_success is True and exec_message.startswith("Confirmation required for risky command.") and directive_type == "ask_user":
+                question_text = special_directive.get('question', "No question provided for risky command.")
+                logging.info(f"Execution yielded for risky command confirmation: {question_text}")
+                pending_risky_action = action_to_execute.copy() # type: ignore
+                results.append(((action_to_execute, True, f"Confirmation required: {question_text}", special_directive))) # type: ignore
+                yield_result = {"type": "ask_user", "question": question_text}
+                user_response_to_ask = yield yield_result
+                if user_response_to_ask is None:
+                    logging.warning("User cancelled during risky command confirmation.")
+                    results[-1] = (action_to_execute, False, "User cancelled risky command confirmation.", None) # type: ignore
+                    pending_risky_action = None; break
+                if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "user", "content": user_response_to_ask})
+                continue
 
             if isinstance(special_directive, dict) and "token_usage" in special_directive:
                 action_tokens = special_directive.get("token_usage")
-                if agent_state.current_task and isinstance(action_tokens, dict) and all(k in action_tokens for k in ["prompt_tokens", "candidates_tokens", "total_tokens"]): # type: ignore
-                    agent_state.current_task._accumulate_tokens(action_tokens) # type: ignore
+                if agent_state.current_task and isinstance(action_tokens, dict): agent_state.current_task._accumulate_tokens(action_tokens)
 
             if directive_type == "ask_user":
-                question_text = special_directive.get('question', '') # type: ignore
-                logging.info(f"Execution yielded for user input: {exec_message}")
-                results.append(((action_to_execute, exec_success, exec_message, special_directive)))
-
-                is_credential_consent_question = "'manual', 'onetime', or 'remember'" in question_text.lower()
-                is_plan_choice_question = "Which of the above approaches" in question_text and "would you like to proceed with?" in question_text
-
-                if is_credential_consent_question:
-                    match_service = re.search(r"for '([^']+)'", question_text)
-                    match_user = re.search(r"\(user: '([^']+)'\)", question_text)
-                    match_type = re.search(r"need the \[(password|api key|email)\]", question_text, re.IGNORECASE)
-                    if match_service and match_user and match_type:
-                        pending_credential_request = {
-                            'service': match_service.group(1),
-                            'username': match_user.group(1),
-                            'type': match_type.group(1).lower()
-                        }
-                        credential_consent_choice = None
-                        logging.info(f"Identified credential consent request: {pending_credential_request}")
-                    else:
-                        logging.warning("Could not parse service/user/type from credential consent question.")
-                        pending_credential_request = None
-                elif is_plan_choice_question:
-                    logging.info("Identified 'ask_user' as a request for choosing a high-level plan.")
-
-
+                question_text = special_directive.get('question', '')
+                results.append(((action_to_execute, exec_success, exec_message, special_directive))) # type: ignore
                 yield_result = {"type": "ask_user", "question": question_text}
                 user_response_to_ask = yield yield_result
-
                 if user_response_to_ask is None:
                     logging.warning("User cancelled during ask_user.")
                     results[-1] = (action_to_execute, False, "User cancelled during ask_user.", None) # type: ignore
-                    pending_credential_request = None; credential_consent_choice = None
                     break
-
-                logging.info(f"Received user response: '{user_response_to_ask}'.")
                 if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "user", "content": user_response_to_ask})
-                is_risky_command_response = "[RISKY COMMAND]" in question_text
-
-                if pending_credential_request and not credential_consent_choice:
-                    response_lower = user_response_to_ask.lower().strip()
-                    if response_lower in ['manual', 'onetime', 'remember']:
-                        credential_consent_choice = response_lower
-                        logging.info(f"User chose '{response_lower}' for credential handling.")
-                        if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "user", "content": f"{user_response_to_ask} (Chose {response_lower})"})
-                        if response_lower == 'manual': pending_credential_request = None
-                    else:
-                        logging.warning(f"Invalid response ('{user_response_to_ask}') to credential consent.")
-                        if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "user", "content": f"{user_response_to_ask} (Invalid choice for consent)"})
-                        pending_credential_request = None
-                    continue
-                elif pending_credential_request and credential_consent_choice in ['onetime', 'remember']:
-                    credential_value = user_response_to_ask
-                    service = pending_credential_request.get('service', 'unknown_service')
-                    username = pending_credential_request.get('username', 'unknown_user')
-                    logging.info(f"Received credential value for {service} (user: {username}).")
-                    if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "user", "content": f"[CREDENTIAL PROVIDED FOR {service}]"})
-                    if credential_consent_choice == 'remember':
-                        save_credential(service, username, credential_value)
-                    if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "system", "content": f"System Internal Note: Credential value provided='{credential_value}'"})
-                    pending_credential_request = None; credential_consent_choice = None
-                    continue
-                elif is_risky_command_response:
-                    response_lower = user_response_to_ask.lower().strip()
-                    if response_lower == 'yes':
-                        logging.info("User confirmed risky command execution.")
-                    else:
-                        logging.warning(f"User denied risky command execution (Response: '{user_response_to_ask}').")
-                    total_consecutive_failures = 0; consecutive_failures_on_current_step = 0; replan_attempts_current_cycle = 0
-                    continue
-                elif is_plan_choice_question:
-                    logging.info(f"User chose plan option: '{user_response_to_ask}'")
-                    if "stop" not in user_response_to_ask.lower():
-                        if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "assistant", "content": f"Okay, proceeding with the approach: {user_response_to_ask}"})
-                        yield {"type": "inform_user", "message": f"Okay, I will now work on the approach: '{user_response_to_ask[:100]}...'"}
-                        current_task_instruction = f"User chose to proceed with the approach: {user_response_to_ask}. Now, create a detailed plan for this approach."
-                        plan_source = f"Chosen High-Level Plan: {user_response_to_ask}"
-                    else:
-                        logging.info("User chose to stop after being presented with plan options.")
-                        task_completed = True
-                        break
-                    total_consecutive_failures = 0; consecutive_failures_on_current_step = 0; replan_attempts_current_cycle = 0
-                    continue
-                else:
-                    logging.info("Received user response to a general 'ask_user'. Continuing loop for replanning.")
-                    total_consecutive_failures = 0; consecutive_failures_on_current_step = 0; replan_attempts_current_cycle = 0
-                    continue
-
-            elif directive_type == "inform_user":
-                message_to_display = special_directive.get('message', '') # type: ignore
-                logging.info(f"Execution yielded for informing user: {message_to_display}")
-
-                if "--- START MERMAID CODE ---" in message_to_display and "--- END MERMAID CODE ---" in message_to_display:
-                    logging.info("INFORM_USER message appears to contain high-level plan options.")
-
-                youtube_refs = special_directive.get("youtube_references", []) # type: ignore
-                if agent_state.current_task:
-                    if youtube_refs:
-                        agent_state.current_task.youtube_references.extend(youtube_refs) # type: ignore
-                        message_with_refs = {
-                            "role": "assistant",
-                            "content": f"ℹ️ {message_to_display}",
-                            "references": youtube_refs
-                        }
-                        agent_state.current_task.conversation_history.append(message_with_refs)
-                    else:
-                        agent_state.current_task.conversation_history.append({
-                            "role": "assistant",
-                            "content": f"ℹ️ {message_to_display}"
-                        })
-
-                agent_state.task_is_paused = True
-                agent_state.is_task_running = True # This seems contradictory, should be False if paused
-                if agent_state.current_task: agent_state.current_task.status = "paused"
-                _ = {"type": "inform_user", "message": message_to_display, "youtube_references": youtube_refs} # yield_result not used
                 total_consecutive_failures = 0; consecutive_failures_on_current_step = 0; replan_attempts_current_cycle = 0
+                current_task_instruction = user_response_to_ask
+                action_to_execute = None
                 continue
-
+            elif directive_type == "inform_user":
+                message_to_display = special_directive.get('message', '')
+                agent_state.task_is_paused = True
+                if agent_state.current_task: agent_state.current_task.status = "paused"
+                yield {"type": "inform_user", "message": message_to_display, "youtube_references": special_directive.get("youtube_references", []), "image_data": special_directive.get("image_data")}
+                total_consecutive_failures = 0; consecutive_failures_on_current_step = 0; replan_attempts_current_cycle = 0
+                action_to_execute = None
+                continue
             elif directive_type == "inject_plan":
-                logging.info(f"Action '{action_type}' directed to inject a new plan. Reason: {special_directive.get('reason')}") # type: ignore
-                if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "system", "content": f"System: {exec_message} - New plan will be injected."})
-                plan_to_inject = special_directive.get("plan", []) # type: ignore
-                plan_injection_reason = special_directive.get("reason", "Unknown directive") # type: ignore
-                total_consecutive_failures = 0
-                consecutive_failures_on_current_step = 0
-                replan_attempts_current_cycle = 0
-            elif directive_type in ["search_result", "youtube_search_result", "screen_description", "generation_complete", "generation_failed", "generation_error", "listener_timeout_no_actions", "image_generation_result", "file_processing_result"]: # Added file_processing_result
-                logging.info(f"Action '{action_type}' completed with data directive: {directive_type}. Original success status and message preserved for assessment.")
-                if directive_type == "image_generation_result":
-                    details = special_directive.get("details", {})
-                    if details.get("success", False):
-                        # If image generation was successful, add the result to conversation history
-                        if agent_state.current_task:
-                            image_data = details.get("image_data")  # Get image_data from details
-                            message = details.get("message", "Image generated successfully")
-                            # Format the message to include the image in a chat-friendly way
-                            chat_message = {
-                                "role": "assistant",
-                                "content": f"✅ {message}",
-                                "image_data": image_data  # Use image_data instead of image
-                            }
-                            agent_state.current_task.conversation_history.append(chat_message)
-                        return "TASK_COMPLETE", exec_message, token_usage
-                    else:
-                        # If image generation failed, add error to conversation history
-                        if agent_state.current_task:
-                            error_message = details.get("message", "Image generation failed")
-                            agent_state.current_task.conversation_history.append({
-                                "role": "assistant",
-                                "content": f"❌ {error_message}"
-                            })
-                        exec_success = False
-                        exec_message = error_message
-            elif special_directive is None:
-                pass
-            else:
-                logging.error(f"Unexpected and unhandled special directive type: {directive_type} from action {action_type}. Treating as execution failure.")
-                exec_success = False
-                exec_message = f"Execution failed due to unexpected and unhandled special directive: {directive_type}"
-        elif isinstance(exec_result, tuple) and len(exec_result) == 2:
-            exec_success, exec_message = exec_result # type: ignore
-            special_directive = None
-        else:
-            exec_success = False
-            exec_message = f"Unexpected return type from execute_action: {type(exec_result)}"
-            logging.error(exec_message)
-            results.append(((action_to_execute, exec_success, exec_message, None))) # type: ignore
-
-        logging.info(f"Execution Result: {'OK' if exec_success else 'FAIL'} - {exec_message}")
-
-        screenshot_after_action = None
-        if action_type in {"click", "type", "focus_window", "click_and_type", "move_mouse"} or not exec_success:
-            time.sleep(0.5)
-            screenshot_after_action = capture_full_screen()
-            if screenshot_after_action is None: logging.warning("Failed to capture screenshot for assessment.")
+                plan_to_inject = special_directive.get("plan", [])
+                plan_injection_reason = special_directive.get("reason", "Unknown directive")
+                total_consecutive_failures = 0; consecutive_failures_on_current_step = 0; replan_attempts_current_cycle = 0
 
         string_history_for_assessment = [f"{msg['role']}: {msg['content']}" for msg in (agent_state.current_task.conversation_history if agent_state.current_task else [])]
-        assessment_status, assessment_reasoning, assessment_tokens = assess_action_outcome(
-            instruction_for_current_planning_cycle, action_to_execute, exec_success, exec_message,
-            screenshot_after_action, llm_model, screenshot_before_hash=screenshot_before_action_hash
+        assessment_status, assessment_reasoning, assessment_tokens = assess_action_outcome( # type: ignore
+            instruction_for_current_planning_cycle, action_to_execute, exec_success, exec_message, # type: ignore
+            capture_full_screen(), llm_model, screenshot_before_hash=screenshot_before_action_hash
         )
         if agent_state.current_task: agent_state.current_task._accumulate_tokens(assessment_tokens)
         final_message = f"{exec_message} | Assessment: {assessment_status} - {assessment_reasoning}"
-        
-        # After action execution and assessment:
-        system_observation = f"System Observation: {final_message}"
-        if agent_state.current_task: 
-            agent_state.current_task.conversation_history.append({
-                "role": "system", 
-                "content": system_observation
-            })
-        
+        if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "system", "content": f"System Observation: {final_message}"})
         final_success = (assessment_status == "SUCCESS")
-        results.append(((action_to_execute, final_success, final_message, special_directive)))
+        results.append(((action_to_execute, final_success, final_message, special_directive))) # type: ignore
         logging.info(f"Assessment Result: {assessment_status} - {assessment_reasoning}")
-        last_assessment_screenshot_hash = _hash_pil_image(screenshot_after_action)
-
-        if agent_state.current_task and (assessment_status == "FAILURE" or (assessment_status == "RETRY_POSSIBLE" and consecutive_failures_on_current_step >= MAX_RETRIES_PER_STEP)):
-            action_type_failed = action_to_execute.get('action_type')
-            action_failure_counts[action_type_failed] = action_failure_counts.get(action_type_failed, 0) + 1 # type: ignore
-            logging.warning(f"Incremented failure count for '{action_type_failed}': {action_failure_counts.get(action_type_failed)}") # type: ignore
-
-            if action_type_failed == "search_youtube" and action_failure_counts.get(action_type_failed, 0) > MAX_YOUTUBE_SEARCH_ATTEMPTS: # type: ignore
-                agent_state.current_task.conversation_history.append({"role": "system", "content": "System Note: YouTube search tool disabled for this task due to repeated failures."})
-                logging.warning(f"YouTube search tool disabled for this task after {MAX_YOUTUBE_SEARCH_ATTEMPTS} failures.")
-
-        if agent_state.current_task: agent_state.current_task.agent_thoughts.append({"timestamp": datetime.now().isoformat(), "content": f"Step {current_iteration} Action: {action_type} {params}\nOutcome: {assessment_status} - {assessment_reasoning}", "type": "step_outcome"})
-
-        if agent_state.current_task and agent_state.current_task.conversation_history and \
-        agent_state.current_task.conversation_history[-1].get("role") == "system" and \
-        "System Internal Note: Credential value provided=" in agent_state.current_task.conversation_history[-1].get("content", ""):
-            agent_state.current_task.conversation_history.pop()
+        if agent_state.current_task: agent_state.current_task.agent_thoughts.append({"timestamp": datetime.now().isoformat(), "content": f"Step {current_iteration} Action: {action_type} {params}\nOutcome: {assessment_status} - {assessment_reasoning}", "type": "step_outcome"}) # type: ignore
 
         if assessment_status == "SUCCESS":
             total_consecutive_failures = 0
@@ -1076,25 +1018,42 @@ def iterative_task_executor(
             if plan_injection_reason and not plan_to_inject:
                 logging.info(f"Successfully completed injected plan (Reason: {plan_injection_reason}).")
                 plan_injection_reason = None
+            
+            if action_type == "task_complete" and not is_legitimate_overall_completion_check_for_action: # type: ignore
+                logging.info(f"Intermediate sub-task {current_sub_task_index + 1} ('{current_sub_tasks[current_sub_task_index]}') successfully completed via 'task_complete' action.")
+            
             if current_sub_tasks and 0 <= current_sub_task_index < len(current_sub_tasks):
-                logging.info(f"Sub-task {current_sub_task_index + 1} ('{current_sub_tasks[current_sub_task_index]}') appears complete.")
+                logging.info(f"Sub-task {current_sub_task_index + 1} ('{current_sub_tasks[current_sub_task_index]}') processing was successful.")
                 current_sub_task_index += 1
-                if agent_state.current_task and hasattr(agent_state.current_task, 'current_sub_task_index'): agent_state.current_task.current_sub_task_index = current_sub_task_index # type: ignore
+                if agent_state.current_task and hasattr(agent_state.current_task, 'current_sub_task_index'):
+                    agent_state.current_task.current_sub_task_index = current_sub_task_index
 
                 if current_sub_task_index < len(current_sub_tasks):
-                    next_sub_task_info = f"Completed sub-task. Moving to sub-task {current_sub_task_index + 1}/{len(current_sub_tasks)}: '{current_sub_tasks[current_sub_task_index]}'."
-                    if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "assistant", "content": next_sub_task_info})
-                    yield {"type": "inform_user", "message": next_sub_task_info} 
+                    next_sub_task_instruction = current_sub_tasks[current_sub_task_index]
+                    next_sub_task_log_info = f"System: Advancing to sub-task {current_sub_task_index + 1}/{len(current_sub_tasks)}: '{next_sub_task_instruction}'."
+                    logging.info(next_sub_task_log_info)
+                    if agent_state.current_task:
+                        agent_state.current_task.conversation_history.append({"role": "system", "content": next_sub_task_log_info})
                 else:
-                    logging.info("All sub-tasks completed.") 
+                    logging.info("All sub-tasks completed.")
+                    if not task_completed:
+                        logging.info("All sub-tasks finished. Marking overall task as complete.")
+                        task_completed = True
+            
+            if task_completed:
+                if agent_state.current_task and (not results or results[-1][0].get("action_type") != "task_complete"): # type: ignore
+                     agent_state.current_task.conversation_history.append({"role": "system", "content": "Overall task completed."})
+                logging.info(f"Overall task '{original_instruction}' completed.")
+                break
             continue
+
         elif assessment_status == "RETRY_POSSIBLE":
             if consecutive_failures_on_current_step < MAX_RETRIES_PER_STEP:
                 consecutive_failures_on_current_step += 1
                 logging.warning(f"Assessment RETRY_POSSIBLE. Retrying step (Attempt {consecutive_failures_on_current_step + 1}/{MAX_RETRIES_PER_STEP + 1}). Reason: {assessment_reasoning}")
                 results[-1] = (action_to_execute, False, f"{exec_message} | Assessment: RETRY_POSSIBLE - {assessment_reasoning} (Retry {consecutive_failures_on_current_step})", special_directive) # type: ignore
                 time.sleep(1.0)
-                current_iteration -= 1
+                current_iteration -=1
                 continue
             else:
                 logging.error(f"Max retries ({MAX_RETRIES_PER_STEP}) for current step reached after RETRY_POSSIBLE. Treating as FAILURE.")
@@ -1105,91 +1064,21 @@ def iterative_task_executor(
             logging.error(f"Assessment FAILURE for step. Reason: {assessment_reasoning}")
             total_consecutive_failures += 1
             consecutive_failures_on_current_step = 0
-
-            is_planning_failure = "Planning failed: Could not parse valid action from LLM response" in assessment_reasoning or \
-                                "Planning failed: LLM response structure was invalid" in assessment_reasoning or \
-                                "Planning failed: Invalid 'multi_action' structure" in assessment_reasoning or \
-                                "Planning failed: Invalid action type" in assessment_reasoning or \
-                                "Planning failed: Invalid 'run_python_script' parameters" in assessment_reasoning
-
+            is_planning_failure = "Planning failed:" in assessment_reasoning
             if is_planning_failure:
-                logging.warning("Planning failed due to invalid LLM response format/structure. Asking user for guidance directly.")
-                ask_question = f"My planning failed. The error was: {assessment_reasoning}. How should I proceed? (e.g., 'stop', 'retry planning', or provide specific instructions)"
-                ask_action = {"action_type": "ask_user", "parameters": {"question": ask_question}}
-                yield_result = {"type": "ask_user", "question": ask_question}
-                user_response_to_ask = yield yield_result
-
-                if user_response_to_ask is None:
-                    logging.warning("Generator received None when expecting input for planning failure guidance. Defaulting to 'stop'.")
-                    user_response_to_ask = "stop"
-
-                results.append(((ask_action, True, f"Asked user for guidance on planning failure. Response: '{user_response_to_ask}'", None)))
-                if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "user", "content": user_response_to_ask})
-
-                response_lower = user_response_to_ask.lower()
-                if "stop" in response_lower:
-                    logging.info("User requested to stop after planning failure.")
-                    break
-                else:
-                    logging.info("User provided guidance after planning failure. Will attempt to re-plan in the next iteration using this new input.")
-                    total_consecutive_failures = 0
-                    replan_attempts_current_cycle = 0
-                    current_task_instruction = user_response_to_ask
-                    continue
+                pass
             elif replan_attempts_current_cycle < MAX_REPLAN_ATTEMPTS:
-                replan_attempts_current_cycle += 1
-                logging.warning(f"Attempting replan ({replan_attempts_current_cycle}/{MAX_REPLAN_ATTEMPTS}) due to failure.")
-
-                string_history_for_replan = [f"{msg['role']}: {msg['content']}" for msg in (agent_state.current_task.conversation_history if agent_state.current_task else [])]
-                new_plan_dict, replan_tokens = request_replan_from_failure(
-                    instruction_for_current_planning_cycle, results, action_to_execute, assessment_reasoning,
-                    screenshot_after_action, llm_model
-                )
-                if agent_state.current_task: agent_state.current_task._accumulate_tokens(replan_tokens)
-                if new_plan_dict and new_plan_dict.get("plan"):
-                    logging.info(f"Replanning successful. New plan has {len(new_plan_dict['plan'])} steps. Restarting execution cycle with new plan.")
-                    plan_to_inject = new_plan_dict.get("plan")
-                    plan_injection_reason = f"Replanned after failure (Attempt {replan_attempts_current_cycle})"
-                    plan_source = "Replanned"
-                    if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "system", "content": f"System: Replanning attempt {replan_attempts_current_cycle} successful. New plan generated."})
-                    results.append((({'action_type': 'REPLAN', 'parameters': {'attempt': replan_attempts_current_cycle, 'reason': 'failure'}}, True, f"Replanned. New plan: {len(plan_to_inject) if plan_to_inject else 0} steps.", None))) # type: ignore
-                    total_consecutive_failures = 0
-                    continue
-                else:
-                    logging.error(f"Replanning attempt {replan_attempts_current_cycle} failed to generate a valid new plan.")
-                    results.append((({'action_type': 'REPLAN', 'parameters': {'attempt': replan_attempts_current_cycle}}, False, "Replanning failed to produce plan.", None)))
-
+                pass
+            
             if total_consecutive_failures >= MAX_CONSECUTIVE_FAILURES_BEFORE_ASK:
-                logging.warning(f"Reached {total_consecutive_failures} total consecutive failures (including failed replans). Asking user for guidance.")
-                ask_question = f"I've encountered repeated failures. The last error was: {assessment_reasoning}. How should I proceed? (e.g., 'stop', 'retry differently', 'skip step', or provide specific instructions)"
-                ask_action = {"action_type": "ask_user", "parameters": {"question": ask_question}}
-                yield_result = {"type": "ask_user", "question": ask_question}
-                user_response_to_ask = yield yield_result
-
-                if user_response_to_ask is None:
-                    logging.warning("Generator received None when expecting input for failure guidance. Defaulting to 'stop'.")
-                    user_response_to_ask = "stop"
-
-                results.append(((ask_action, True, f"Asked user for guidance on failure. Response: '{user_response_to_ask}'", None)))
-                if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "user", "content": user_response_to_ask})
-
-                response_lower = user_response_to_ask.lower()
-                if "stop" in response_lower:
-                    logging.info("User requested to stop after failure.")
-                    break
-                else:
-                    logging.info("User provided guidance. Will attempt to re-plan in the next iteration using this new input.")
-                    total_consecutive_failures = 0
-                    replan_attempts_current_cycle = 0
-                    current_task_instruction = user_response_to_ask
-                    continue
+                pass
             else:
-                logging.warning("Failure encountered, but not a planning failure, replan attempts available, and total failures below threshold. Proceeding to next iteration for standard planning.")
+                logging.warning("Failure encountered. Proceeding to next iteration for standard planning or further failure handling.")
                 continue
         else:
             if current_sub_tasks and current_sub_task_index >= len(current_sub_tasks):
-                logging.info("All defined sub-tasks have been processed.")
-                task_completed = True 
+                logging.info("All defined sub-tasks processed or unexpected assessment on last one.")
+                task_completed = True
                 break
             logging.error(f"Assessment returned unexpected status '{assessment_status}'. Stopping. Reason: {assessment_reasoning}")
             break
@@ -1197,14 +1086,13 @@ def iterative_task_executor(
     if agent_state.current_task and current_iteration >= max_iterations:
         logging.warning(f"Execution stopped: Max iterations ({max_iterations}) reached.")
         results.append((({'action_type': 'STOP', 'parameters': {'reason': 'max_iterations'}}, False, f"Max iterations reached.", None)))
-        agent_state.current_task.agent_thoughts.append({"timestamp": datetime.now().isoformat(), "content": f"Execution stopped: Max iterations ({max_iterations}) reached.", "type": "stop"})
+        if agent_state.current_task: agent_state.current_task.agent_thoughts.append({"timestamp": datetime.now().isoformat(), "content": f"Execution stopped: Max iterations ({max_iterations}) reached.", "type": "stop"})
 
     final_status = "incomplete"
     execution_summary_for_db = f"Instruction: {original_instruction}\nOutcome: "
-
-    if task_completed and not results: 
+    if task_completed and not results:
         final_status = "success"
-        execution_summary_for_db += f"{final_status.upper()} - All sub-tasks completed."
+        execution_summary_for_db += f"{final_status.upper()} - Task marked complete with no actions or all sub-tasks completed."
     elif results:
         last_action_tuple = results[-1]
         last_action_dict, last_success, last_message, _ = last_action_tuple # type: ignore
@@ -1212,12 +1100,12 @@ def iterative_task_executor(
             final_status = "success"
         elif not last_success :
             final_status = "failure"
-        elif task_completed: 
+        elif task_completed:
             final_status = "success"
         execution_summary_for_db += f"{final_status.upper()} - Last action: {last_action_dict.get('action_type', 'N/A')}. Message: {last_message}"
     else:
-        execution_summary_for_db += "No actions attempted or recorded."
-        final_status = "failure"
+        execution_summary_for_db += "No actions attempted or task did not complete."
+        final_status = "failure" if not task_completed else "incomplete"
 
     serializable_results = []
     for r_action, r_success, r_message, r_directive in results:
@@ -1228,8 +1116,7 @@ def iterative_task_executor(
 
     if agent_state.current_task:
         agent_state.current_task.action_failure_counts = action_failure_counts
-        save_task_execution_to_db(original_instruction, execution_summary_for_db, full_results_json, final_status, plan_source, user_feedback=None)
-
+        save_task_execution_to_db(original_instruction, execution_summary_for_db, full_results_json, final_status, plan_source, user_feedback=None) # type: ignore
         agent_state.current_task.status = "completed" if final_status == "success" else "failed"
         agent_state.current_task.end_time = datetime.now()
         agent_state.is_task_running = False
@@ -1248,19 +1135,23 @@ def process_next_step(
     current_reinforcements: List[str] = None,
     planning_screenshot_pil: Optional[Image.Image] = None,
     benchmark_mode: bool = False,
-    executed_actions_summary: Optional[str] = None
+    executed_actions_summary: Optional[str] = None,
+    # New parameters for sub-task context
+    overall_original_instruction: Optional[str] = None, # The user's very first instruction for the whole task
+    all_sub_tasks_count: int = 0, # Total number of sub-tasks if they exist
+    current_sub_task_idx: int = -1 # 0-based index of the current sub-task being planned
 ) -> Tuple[Optional[dict], Dict[str, int]]:
     # Check if we already have a successful image generation
     for line in reversed(history):
         if "System Observation:" in line:
             if "IMAGE_GENERATED:" in line:  # Updated check
                 return {
-                    "plan": [{
+                    "next_action": { # Changed from "plan": [{...}] to "next_action": {...}
                         "action_type": "INFORM_USER",
                         "parameters": {
                             "message": "The image has already been successfully generated. Task is complete."
                         }
-                    }],
+                    },
                     "reasoning": "Image generation task was already completed successfully."
                 }, {"prompt_tokens": 0, "candidates_tokens": 0, "total_tokens": 0}
 
@@ -1319,24 +1210,40 @@ def process_next_step(
     
     executed_actions_summary_str = executed_actions_summary if executed_actions_summary else "No actions executed yet in this task."
 
+    # original_instruction for this function is the current sub-task's instruction.
+    # overall_original_instruction is the main goal.
+    sub_task_info_for_prompt = ""
+    if overall_original_instruction and all_sub_tasks_count > 0 and current_sub_task_idx != -1:
+        sub_task_info_for_prompt = f"""
+--- SUB-TASK CONTEXT ---
+You are currently working on a specific sub-task as part of a larger user request.
+Overall User Goal: "{overall_original_instruction}"
+Total Sub-tasks: {all_sub_tasks_count}
+Current Sub-Task Number: {current_sub_task_idx + 1}
+Instruction for THIS Current Sub-Task: "{original_instruction}"
+---
+"""
 
     task_name_base = sanitize_filename(original_instruction)[:30]
 
     prompt = rf"""
---- USER GOAL ---
-**Initial User Goal:**
+--- CURRENT SUB-TASK OBJECTIVE / USER GOAL ---
+**Instruction for this step (current sub-task):**
 "{original_instruction}"
 
+{sub_task_info_for_prompt}
 --- HISTORY & CONTEXT ---
 **Recent History (Actions, Outcomes, Observations, User Responses, Critiques):**
 {history_str}
 *   **CRITICAL: Focus on the LATEST user message/response.** This defines the current objective. If the user just agreed to create a specialized agent or selected an LLM, plan the next step for *that* process.
 *   **IF A "Critique failed" message is in the LATEST history entries:**
-    *   The `reasoning` for that critique (e.g., "action was unrelated to the LATEST user instruction") is the MOST IMPORTANT piece of information for your next plan.
+    *   The `reasoning` for that critique (e.g., "action was unrelated to the LATEST user instruction", "action was redundant") is the MOST IMPORTANT piece of information for your next plan.
     *   Your `next_action` MUST directly address the LATEST user instruction and AVOID the specific pitfall highlighted by the critique.
-    *   DO NOT repeat the same type of irrelevant action or an action that led to the critique.
+    *   DO NOT repeat the same type of irrelevant or redundant action.
 *   **CRITICAL: Learn from critiques.** Avoid repeating actions that failed critique due to redundancy, speculation, or irrelevance.
 *   Note: "System Observation: Screen content changed..." indicates the visual state changed.
+*   Note: "System Observation: Active application changed to 'app_name.exe'." or "System Observation: Opened web URL: https://example.com" indicates the current application context.
+*   **VERY IMPORTANT CONTEXT CHECK:** Before planning `navigate_web` or `run_shell_command` to open an application, check the LATEST "System Observation" in history. If it indicates you are already on the target URL (e.g., "System Observation: Opened web URL: https://www.youtube.com") or the target application is already active (e.g., "System Observation: Active application changed to 'youtube.com' or 'chrome.exe' showing YouTube"), DO NOT plan to navigate or open it again if the sub-task is to interact *within* that page/app. Instead, plan actions *within* that context (e.g., `click_and_type` in a search bar, `click` on a video).
 *   Note: Check history for user responses to 'ask_user', especially regarding automation, project details, LLM choices, or credentials.
 
 **Actions Already Executed in Current Task Iteration (Most Recent First):**
@@ -1354,10 +1261,62 @@ def process_next_step(
 
 --- TASK PRIORITIZATION & RESPONSE STRATEGY ---
 
---- META-PLANNING FOR COMPLEX PROJECTS ---
-IF the user's LATEST instruction describes a very complex, multi-stage project (e.g., "build an ecommerce website with an AI chatbot", "create a data analysis pipeline for X", "develop a mobile app for Y", "design and implement a customer support system with AI features"),
-THEN, your FIRST step is to consider if you have enough information to propose high-level strategic paths OR if you need to gather more information first.
+--- META-PLANNING FOR COMPLEX PROJECTS (e.g., "create a project", "build an app", "design a system") ---
+IF the LATEST user instruction describes a complex, multi-stage project (especially involving creation or design of software, systems, or substantial files) AND you are at the beginning of this project (no significant project-specific actions taken yet in history for this goal):
 
+1.  **Initial Check & User Response Handling:**
+    *   **IF the PREVIOUS action was `INFORM_USER` presenting multiple paths with "--- START MERMAID CODE ---" markers:**
+        *   Your `next_action` MUST be `{{ "action_type": "ask_user", "parameters": {{ "question": "Which of the above approaches (e.g., 'Path 1' or by title) would you like to proceed with? Or, would you like me to research further or suggest alternatives?" }} }}`.
+        *   `reasoning`: "Asking user to select a development path after presenting options."
+        *   **STOP HERE. Do not proceed to other planning steps below if this condition is met.**
+    *   **IF the LATEST user message in history is a response to the path selection question above:**
+        *   Analyze the user's choice.
+        *   Your `next_action` should be to start implementing the CHOSEN path. This might involve a `multi_action` for the first few steps of that path, or a single action like `write_file` for the main project file.
+        *   Your `reasoning` should state: "Proceeding with user's chosen path: [User's Choice]. Starting with [first action of chosen path]."
+        *   **STOP HERE. Do not proceed to other planning steps below if this condition is met.**
+
+2.  **Research Phase (If no paths presented yet, or if user asked for more research):**
+    *   **Check History:** Have you already performed web searches for "how to [do the project]", "technologies for [project type]", "steps to create [X]" in the very recent history for THIS specific project goal?
+    *   **IF NOT (no recent relevant research for this project):**
+        *   Your `next_action` SHOULD be `search_web` or a `multi_action` of `search_web` and/or `search_youtube` actions.
+        *   **Example Query:** "best ways to create a Python script for web scraping and data storage" or "modern tech stack for a simple blog website".
+        *   `reasoning`: "Researching best practices, technologies, and common steps for creating the requested project/file before proposing implementation paths."
+        *   **STOP HERE. Do not proceed to other planning steps below if this condition is met.**
+
+3.  **Path Proposal Phase (After research results are in history and no paths presented yet):**
+    *   **Check History:** Are there recent `search_web` or `search_youtube` results in history relevant to this project?
+    *   **IF YES (and you haven't presented paths yet):**
+        *   Your `next_action` MUST be `{{ "action_type": "INFORM_USER", "parameters": {{ "message": "..." }} }}`.
+        *   The `message` parameter should be a string containing:
+            *   An introduction, e.g., "Okay, I've researched how to approach '[original_instruction]'. Here are a few potential paths:\n\n"
+            *   **Path 1:**
+                *   "**Path 1: [Concise Title for Approach 1, e.g., Using Flask and SQLite]**\n"
+                *   "[One-paragraph description of this approach, key steps, major technologies, and brief pros/cons. If based on web search, you can briefly mention key findings.]\n"
+                *   "--- START MERMAID CODE ---\n"
+                *   "sequenceDiagram\n"
+                *   "    User->>Agent: Request to build X\n"
+                *   "    Agent->>System: Plan initial setup (e.g., Flask app.py)\n"
+                *   "    System->>Agent: Execute setup\n"
+                *   "    Agent->>System: Plan database models\n"
+                *   "    System->>Agent: Execute DB setup\n"
+                *   "    Agent->>User: Show progress / Ask for next feature\n"
+                *   "--- END MERMAID CODE ---\n\n"
+            *   **Path 2 (and optionally Path 3):** Similar structure as Path 1, presenting a different approach.
+                *   "**Path 2: [Concise Title for Approach 2, e.g., Static Site Generator with Netlify]**\n"
+                *   "[Description...]\n"
+                *   "--- START MERMAID CODE ---\n"
+                *   "sequenceDiagram\n"
+                *   "    ...\n"
+                *   "--- END MERMAID CODE ---"
+            *   (Ensure Mermaid code is valid and uses `sequenceDiagram`. Use `\n` for newlines within the message string.)
+        *   `reasoning`: "Presenting researched high-level strategic paths to the user for selection, including Mermaid diagrams for clarity."
+        *   **STOP HERE. Do not proceed to other planning steps below if this condition is met.**
+
+ELSE (if not a complex project initiation, or if a path has been chosen and implementation is underway):
+    Proceed with the standard planning logic below (Informational Queries, Task Completion, etc.).
+--- END META-PLANNING FOR COMPLEX PROJECTS ---
+
+--- STANDARD PLANNING LOGIC ---
 1.  **Information Gathering (If Needed):**
     *   **Consider the project's nature:** Is it a common type of project with well-known architectures (e.g., a standard web app)? Or is it niche, requiring research?
     *   **Check Learnings/Reinforcements:** Do any past learnings from the DB suggest specific architectures, tools, or user preferences for similar complex tasks?
@@ -1372,10 +1331,7 @@ THEN, your FIRST step is to consider if you have enough information to propose h
                 {{ "action_type": "read_file", "parameters": {{ "file_path": "C:\\Users\\MyUser\\Documents\\project_notes\\past_ecommerce_learnings.txt" }} }}
             ] }} }}`
         *   Your `reasoning` should explain why you are performing this research (e.g., "To comprehensively research architectures, AI tools, and frontend technologies for the e-commerce project before proposing high-level plans.").
-    *   **AFTER information gathering (in a subsequent turn, once search results are in history):** You will then proceed to the "COMPLEX TASK - MULTIPLE PATH PROPOSAL" stage below, using the gathered information to inform your proposed paths.
-
-2.  **Proceed to Path Proposal (If sufficient info or after gathering info):**
-    *   If you have sufficient information (either from prior knowledge, learnings, or recent search results in history), then proceed directly to the "COMPLEX TASK - MULTIPLE PATH PROPOSAL (INFORM & ASK)" section below.
+    *   **AFTER information gathering (in a subsequent turn, once search results are in history):** The "META-PLANNING FOR COMPLEX PROJECTS" section (Path Proposal Phase) will handle proposing paths.
 
 --- COMPLEX TASK - MULTIPLE PATH PROPOSAL (INFORM & ASK) ---
 IF you are at the stage of proposing multiple paths (either directly or after information gathering),
@@ -1393,9 +1349,7 @@ For each proposed path within the `message`, you MUST include:
     `    WebApp-->>User: Result`
     `--- END MERMAID CODE ---`
     (Ensure newlines `\n` are correctly represented if generating this as part of a JSON string, but for the `INFORM_USER` message, literal newlines are fine).
-
 Your `reasoning` for this `INFORM_USER` action should state that you are presenting multiple high-level paths for the complex project, possibly informed by prior research.
-
 **IMPORTANT FOLLOW-UP:** If the PREVIOUS action was `INFORM_USER` and its message contained these multi-path proposals (identifiable by "--- START MERMAID CODE ---" markers), your *current* `next_action` MUST be `{{ "action_type": "ask_user", "parameters": {{ "question": "Which of the above approaches (e.g., 'Path 1' or by title) would you like to proceed with?" }} }}`.
 --- END COMPLEX TASK SECTIONS ---
 
@@ -1403,6 +1357,27 @@ Your `reasoning` for this `INFORM_USER` action should state that you are present
     *   **IF the LATEST user message is primarily an informational question** (e.g., "What is X?", "How does Y work?", "Tell me about Z", "What are the best ways to do A?", "will X release Y?", "Konami upcoming games?"), consider the following:
         *   **CRITICAL CHECK FOR PRIOR SEARCH:**
             *   Examine the **Recent History**.
+*   **Shortcut Prioritization (VERY IMPORTANT):**
+    *   **IF `Application Shortcuts` are available AND contain a relevant shortcut for the current sub-task** (e.g., a shortcut for 'search', 'find', 'open search bar', 'focus search' when the sub-task is to search for something; or 'play/pause', 'next track' for media control):
+        *   Your **FIRST ATTEMPT** to achieve the sub-task **MUST** be to use the relevant shortcut via the `press_keys` action.
+        *   Your `reasoning` for choosing `press_keys` in this case **MUST** state which shortcut you are using and why (e.g., "Using the '/' shortcut to focus the YouTube search bar as per available shortcuts.").
+        *   **Example:** If sub-task is "Search for 'genius by sia'" and shortcuts include "/: Focus search bar", your `next_action` should be `{{ "action_type": "press_keys", "parameters": {{ "keys": ["/"] }} }}`.
+        *   **IF the shortcut only focuses an input field (like a search bar):** Your `next_action` should be a `multi_action` sequence:
+            1.  `press_keys` (to activate/focus the field using the shortcut).
+            2.  `wait` (e.g., 0.1 to 0.3 seconds, ONLY if truly necessary for the field to become active after the shortcut. If the shortcut directly allows typing, this wait can be omitted or very short).
+            3.  `type` (to input the text, e.g., the search query).
+            4.  (Optional) `press_keys` (e.g., ["enter"] to submit the search/form).
+        *   Example (multi_action sequence to search in youtube):
+         ```json
+         {{
+           "action_type": "multi_action",
+           "parameters": {{
+             "sequence": [{{ "action_type": "press_keys", "parameters": {{ "keys": ["/"] }} }}, {{ "action_type": "wait", "parameters": {{ "duration_seconds": 0.5 }} }}, {{ "action_type": "type", "parameters": {{ "text_to_type": "genius by sia" }} }},{{ "action_type": "press_keys", "parameters": {{ "keys": ["enter"] }} }}]
+           }}
+         }}
+         ```
+        *   Your `reasoning` for such a `multi_action` should also explain the shortcut's role.
+        *   Only if no relevant shortcut is found, or if a shortcut attempt has clearly failed (based on history), should you then consider visual actions like `click`, `click_and_type`.
             *   **IF the IMMEDIATELY PRECEDING successful action in the history** was `search_web` or `search_youtube` AND its output (visible in history as 'System Observation: Web Search Result: ...' or 'System Observation: YouTube Search Result: ...') is relevant to the LATEST user's informational question:
                 *   Your `next_action` **MUST** be `{{ "action_type": "INFORM_USER", "parameters": {{ "message": "Based on my recent search: [Concise summary of the relevant search results FROM HISTORY. If the search result indicates no definitive answer, state that clearly, e.g., 'My search did not find a specific release date, but indicated X...']" }} }}`.
                 *   Your `reasoning` MUST state that you are using information from the immediately preceding search result.
@@ -1416,20 +1391,39 @@ Your `reasoning` for this `INFORM_USER` action should state that you are present
                 *   Your `reasoning` should explain why you are choosing the search tool(s).
                 *   **IMPORTANT SELF-CORRECTION:** If your reasoning for planning a search includes a phrase like "results are not yet available in the history" or "planning the search again ensures it is the intended action", this is likely an error. You should only plan a search if one hasn't *just been performed* or if the user is asking for *new/different* information. If a search was the last action, the next step is to process its results.
                 *   **CRITICAL JSON OUTPUT FOR SEARCH:** If planning a search, your `next_action` (e.g., `search_web`, `search_youtube`, or `multi_action` containing them) and `reasoning` MUST be part of the overall JSON object as specified in the main "Output Format" section.
-    *   **ELSE (if it's an actionable task for PC automation AND NOT a complex project requiring the above meta-planning/path proposal flow):** Proceed with the planning logic below.
+    *   **ELSE (if it's an actionable task for PC automation AND NOT a complex project initiation phase as described in "META-PLANNING"):** Proceed with the planning logic below.
     *   **CRITICAL PLANNING CONSTRAINT:** Review the **Recent History** carefully. If you see a "System Note: [Tool Name] tool disabled..." message, you **MUST NOT** plan to use that specific tool (`action_type`) for the remainder of this task. Choose an alternative tool or strategy, or use `ask_user` if no viable alternative exists.
 
- 2.  **Follow-up After `INFORM_USER`:**
+2.  **Follow-up After `INFORM_USER` (Non-Project Path Proposal):**
     *   **IF the PREVIOUS action you took was `INFORM_USER` and it was successful, AND the LATEST user message is not a new actionable task or a direct follow-up question to your information, AND the INFORM_USER message did NOT contain '--- START MERMAID CODE ---' markers (meaning it wasn't a multi-path proposal):**
         *   Your `next_action` MUST be `{{ "action_type": "ask_user", "parameters": {{ "question": "Is there anything else I can help you automate today?" }} }}`.
         *   Your `reasoning` should be "Following up after providing information."
     *   **ELSE:** Proceed with other checks.
 
-3.  **Task Completion Check:**
-    *   **IF the LATEST user instruction seems fully addressed by the PREVIOUS successful action(s) in the history (and it wasn't an informational query that was just answered by `INFORM_USER`):**
-        *   Your `next_action` MUST be `{{ "action_type": "task_complete", "parameters": {{}} }}` (unless the previous action was `INFORM_USER`, in which case see point 2).
-        *   Your `reasoning` should state that the user's goal appears to be met.
-        *   Example: If user said "open YouTube" and the history shows YouTube was just successfully opened, the next action is `task_complete`.
+3.  **Task Completion Flow (Revised):**
+    *   You are currently planning for the instruction: "{original_instruction}".
+    *   This is {(f'sub-task {current_sub_task_idx + 1} of {all_sub_tasks_count} for the overall goal: "{overall_original_instruction}".') if all_sub_tasks_count > 0 and current_sub_task_idx != -1 else "the main/only task."}
+    *   **A. Check for User Response to "Anything else?" question:**
+        *   **IF the LATEST user message in history is a response to a question like "Is there anything else I can help you with?" or "Is there anything more?":**
+            *   **IF the user's response is negative** (e.g., "no", "that's all", "nope", "all good"):
+                *   Your `next_action` MUST be `{{ "action_type": "task_complete", "parameters": {{}} }}`.
+                *   `reasoning`: "User confirmed no further assistance needed. Completing the task."
+                *   **STOP HERE. This is the final action.**
+            *   **ELSE (user's response is affirmative or a new request):**
+                *   Treat the user's new response as the NEW `original_instruction` for this planning cycle.
+                *   `reasoning`: "User provided a new request or follow-up. Planning for that now."
+                *   Proceed to plan for this new instruction (e.g., it might be a simple action, or trigger complex project planning if it's a new project).
+                *   **STOP HERE if this condition was met and a new instruction is being processed. The rest of the completion check below is skipped.**
+    *   **B. Standard Completion Check (if not handling response to "Anything else?"):**
+        *   **IF the current instruction ("{original_instruction}") appears fully addressed by the PREVIOUS successful action(s) in the history:**
+            *   **AND IF this is the LAST sub-task** (this means {(f'current sub-task {current_sub_task_idx + 1} IS THE LAST of {all_sub_tasks_count} sub-tasks') if all_sub_tasks_count > 0 and current_sub_task_idx != -1 and (current_sub_task_idx + 1 == all_sub_tasks_count) else (f'this is NOT the last sub-task (currently {current_sub_task_idx + 1} of {all_sub_tasks_count})' if all_sub_tasks_count > 0 and current_sub_task_idx != -1 else 'this is the only task')}).
+                *   Then, your `next_action` MUST be `{{ "action_type": "ask_user", "parameters": {{ "question": "I believe I've completed [provide a very brief, 2-5 word summary of what was just accomplished, e.g., 'playing the video', 'creating the Python script', 'searching for news']. Is there anything else I can help you with today?" }} }}`.
+                *   `reasoning`: "The current goal appears to be met. Confirming with the user and asking if further assistance is needed before marking the overall task complete."
+                *   **STOP HERE. This `ask_user` is the planned action.**
+            *   **ELSE (if this is NOT the last sub-task, OR if there's no sub-tasking context and the goal isn't fully met by previous actions):**
+                *   DO NOT use `task_complete` or the "anything else" `ask_user` yet.
+                *   If the current sub-task is complete, and more sub-tasks remain, the executor system will handle advancing. Your focus is on the *current* instruction.
+                *   Proceed to plan the next action for the current instruction ("{original_instruction}").
     *   **ELSE:** Proceed with planning the next sub-step towards the user's goal.
 
 4.  **Handling Multiple Distinct Tasks in One Instruction:**
@@ -1454,7 +1448,8 @@ Your `reasoning` for this `INFORM_USER` action should state that you are present
 *   `{{ "action_type": "ask_user", "parameters": {{ "question": "What filename should I use?" }} }}`
 *   `{{ "action_type": "describe_screen", "parameters": {{}} }}`
 *   `{{ "action_type": "capture_screenshot", "parameters": {{ "file_path": "debug_screenshot.png" }} }}`
-*   `{{ "action_type": "click_and_type", "parameters": {{ "element_description": "Search input field", "text_to_type": "query text" }} }}`
+*   `{{ "action_type": "click_and_type", "parameters": {{ "element_description": "Search input field", "text_to_type": "query text", "press_enter_after": false }} }}` 
+    *   Set `press_enter_after` to `true` if you want to automatically press Enter after typing (e.g., for submitting a search query).
 *   `{{ "action_type": "multi_action", "parameters": {{ "sequence": [ {{...action1...}}, {{...action2...}} ] }} }}`
 *   `{{ "action_type": "task_complete", "parameters": {{}} }}`
 *   `{{ "action_type": "read_file", "parameters": {{ "file_path": "path/to/file.txt" }} }}`
@@ -1462,6 +1457,7 @@ Your `reasoning` for this `INFORM_USER` action should state that you are present
 *   `{{ "action_type": "process_local_files", "parameters": {{ "file_path": "path/to/file.txt", "prompt": "Analyze this file" }} }}`
 *   `{{ "action_type": "process_files_from_urls", "parameters": {{ "url": "https://example.com/file.txt", "prompt": "Analyze this file" }} }}`
 *   `{{ "action_type": "start_visual_listener", "parameters": {{ "description_of_change": "...", "polling_interval_seconds": 10, "timeout_seconds": 300, "actions_on_detection": [{{...plan...}}], "actions_on_timeout": [{{...plan...}}]? }} }}`
+*   `{{ "action_type": "refresh_application_shortcuts", "parameters": {{}} }}`
 *   `{{ "action_type": "edit_image_with_file", "parameters": {{ "image_path": "OPTIONAL_PATH_TO_IMAGE_OR_EMPTY_STRING_FOR_NEW", "prompt": "Description of edits OR image to generate" }} }}`
 
 *   `{{ "action_type": "edit_image_with_file", "parameters": {{ "image_path": "OPTIONAL_PATH_TO_IMAGE_OR_EMPTY_STRING_FOR_NEW", "prompt": "Description of edits OR image to generate" }} }}`
@@ -1489,6 +1485,16 @@ Your `reasoning` for this `INFORM_USER` action should state that you are present
 
 **General Planning & Reasoning Strategy:**
 *   **Context is Key:** Always consider the conversation history and the implied state of the system.
+    *   **Check Current URL/Application:** Before planning `navigate_web` or `run_shell_command` to open an application, check the LATEST "System Observation" in history.
+        *   If the history shows you are already on the target URL (e.g., "System Observation: Opened web URL: https://www.youtube.com" or the active window title in screenshot implies it) AND the current sub-task is to perform an action *on that page* (like searching, clicking a button), **DO NOT plan `navigate_web` to the same URL again.** Instead, plan the interaction (e.g., `click_and_type` for search, `click` for a button).
+        *   Similarly, if the target application is already active (e.g., "System Observation: Active application changed to 'notepad.exe'"), DO NOT plan `run_shell_command` to open it again if the sub-task is to interact with the already open instance.
+    *   **Critique Adherence:** If a previous action was critiqued as "redundant" (especially for navigation), explicitly avoid repeating that navigation.
+    *   **Handling Lost Focus:** If the **Recent History** indicates you were recently in the correct application or on the correct URL for the current sub-task, BUT the **Current Visual Context (Screenshot)** or the LATEST "System Observation: Active application changed to..." shows a *different, incorrect* application is now active (e.g., you were on YouTube, now VS Code is active):
+        *   Your **FIRST `next_action`** MUST be `{{ "action_type": "focus_window", "parameters": {{ "title_substring": "..." }} }}` to attempt to switch back to the correct application window (e.g., browser window containing "YouTube", or "Notepad").
+        *   The `title_substring` should be specific enough to target the correct window (e.g., "YouTube - Brave", "Untitled - Notepad", or a more general "Brave" or "Chrome" if the specific title part is uncertain).
+        *   Only if this `focus_window` action is known to have failed (e.g., from a previous attempt in history for the same situation) OR if there's no known window to focus, should you consider re-opening the application (`run_shell_command`) or re-navigating (`navigate_web`).
+        *   Your `reasoning` should explicitly state that you are attempting to regain focus on the correct application due to a mismatch between recent history and current active window.
+
 *   **Simplicity First:** Prefer simpler, more direct actions (like shell commands or keyboard shortcuts) if they can reliably achieve the sub-goal.
 *   **For simple, direct tasks, you might only need a single action or a short `multi_action` sequence.**
     *   Examples of simple tasks:
@@ -1502,7 +1508,7 @@ Your `reasoning` for this `INFORM_USER` action should state that you are present
     *   **Focus Before Interaction:** Always use `focus_window` before `click` or `type` within a specific application window to ensure the action targets the correct application.
     *   **Specificity for Clicks:** When using `click`, provide a highly specific `element_description` based on visual cues (text label, icon type, relative position) to ensure the correct element is targeted.
 *   **Shell Commands for Backend/Files:** Use `run_shell_command` for file operations (creating, moving, deleting), running scripts, launching applications, or executing background tasks. Be mindful of quoting and escaping within the command string. Avoid using `echo` for creating files with complex or multi-line content unless absolutely necessary and simple.
-    *   **Idempotency/Pre-checks:** When planning to create a directory (`mkdir`) or a file, consider if its pre-existence is an issue.
+    *   **Idempotency/Pre-checks:** When planning to create a directory (`mkdir`) or a file, consider if its pre-existence is an issue. **Prefer `write_file` for creating/editing file content over shell commands like `echo`.**
         *   If the goal is to *ensure* it exists (and pre-existence is fine), the plan can proceed after the creation attempt, even if it reports "already exists".
         *   If pre-existence is a problem (e.g., must be a fresh directory), the plan might need to include steps to delete/rename the existing one first (use `ask_user` if this is destructive and not explicitly requested).
         *   For `write_file`, if overwriting is not desired, plan to check for the file's existence first (e.g., using `run_shell_command` with `dir` or `ls`, then `ask_user` or `read_file` to decide).
@@ -1574,6 +1580,11 @@ Some hints:
     if screenshot_base64:
         content.append({"inline_data": {"mime_type": "image/png", "data": screenshot_base64}})
 
+    token_usage = {"prompt_tokens": 0, "candidates_tokens": 0, "total_tokens": 0}
+    step_dict = None # Initialize step_dict
+    raw_response_text = "" # Initialize raw_response_text
+    cleaned_text = "" # Initialize cleaned_text
+
     try:
         safety_settings = {
              'HARM_CATEGORY_HARASSMENT': 'BLOCK_MEDIUM_AND_ABOVE',
@@ -1584,13 +1595,12 @@ Some hints:
         response = llm_model.generate_content(content, safety_settings=safety_settings)
         token_usage = _get_token_usage(response)
 
-        raw_response_text = ""
         if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
             for part in response.candidates[0].content.parts:
                 if hasattr(part, 'text') and part.text:
                     raw_response_text = part.text.strip()
                     break
-        elif hasattr(response, 'text') and response.text:
+        elif hasattr(response, 'text') and response.text: # Fallback for older response structures
             raw_response_text = response.text.strip()
 
         if not raw_response_text:
@@ -1616,7 +1626,6 @@ Some hints:
 
         logging.debug(f"LLM raw response for next step:\n{raw_response_text}")
 
-        step_dict = None
         text_to_attempt_parse = raw_response_text.strip()
         parse_error_details = ""
 
@@ -1639,9 +1648,7 @@ Some hints:
                         logging.warning(f"demjson3 parsing failed: {e_dem}")
                         step_dict = None
             
-            if step_dict is None: # If direct parsing failed or it didn't look like JSON
-                # This log will appear if it didn't start with { or [ initially,
-                # OR if it did start with {/[ but parsing failed and we are now trying to clean.
+            if step_dict is None: 
                 if not text_to_attempt_parse.startswith(("{", "[")):
                      logging.info(f"Response did not start with '{{' or '['. Content: '{text_to_attempt_parse[:200]}...'. Will attempt cleaning.")
                 
@@ -1676,12 +1683,12 @@ Some hints:
 
         if step_dict is None:
              logging.error(f"Planning failed: Could not parse LLM response as JSON. {parse_error_details}")
-             if 'DEBUG_DIR' in globals() and os.path.isdir(DEBUG_DIR):
+             if 'DEBUG_DIR' in globals() and DEBUG_DIR and os.path.isdir(DEBUG_DIR):
                  problematic_json_path = os.path.join(DEBUG_DIR, f"failed_json_{time.strftime('%Y%m%d-%H%M%S')}.txt")
                  try:
                      with open(problematic_json_path, 'w', encoding='utf-8') as f_err:
                          f_err.write(f"--- Original Raw Response ---\n{raw_response_text}\n")
-                         f_err.write(f"--- String Attempted for Parsing (final state) ---\n{cleaned_text if 'cleaned_text' in locals() and cleaned_text else text_to_attempt_parse}\n")
+                         f_err.write(f"--- String Attempted for Parsing (final state) ---\n{cleaned_text if cleaned_text else text_to_attempt_parse}\n")
                          f_err.write(f"--- Errors ---\n{parse_error_details}\n")
                      logging.error(f"Saved problematic JSON string to {problematic_json_path}")
                  except Exception as save_err:
@@ -1694,7 +1701,7 @@ Some hints:
                  "next_action": {"action_type": "ask_user", "parameters": {"question": "My planning failed (invalid response format). How should I proceed?"}}
              }, token_usage
 
-        if 'DEBUG_DIR' in globals() and os.path.isdir(DEBUG_DIR):
+        if 'DEBUG_DIR' in globals() and DEBUG_DIR and os.path.isdir(DEBUG_DIR):
             results_log_path = os.path.join(DEBUG_DIR, "resultss.txt")
             try:
                 with open(results_log_path, 'a', encoding='utf-8') as f_results:
@@ -1719,15 +1726,7 @@ Some hints:
             action_type = action_to_execute.get("action_type")
             params = action_to_execute.get("parameters", {})
 
-            available_actions = {
-                "run_shell_command", "write_file", "ask_user", "run_python_script",
-                "multi_action", "press_keys", "focus_window", "click", "type",
-                "click_and_type", "move_mouse", "search_web", "navigate_web", "INFORM_USER",
-                "wait", "describe_screen", "task_complete", # process_local_files was already singular here
-                "capture_screenshot", "read_file", "start_visual_listener", "search_youtube",
-                "edit_image_with_file", "process_local_files", "process_files_from_urls"
-            }
-            if action_type not in available_actions:
+            if action_type not in VALID_ACTIONS: # Using the VALID_ACTIONS set
                  logging.error(f"Invalid action_type '{action_type}' in next step.")
                  return {
                      "reasoning": f"Planning failed: Invalid action type '{action_type}' proposed. Asking user for help.",
@@ -1743,10 +1742,10 @@ Some hints:
                         "next_action": {"action_type": "ask_user", "parameters": {"question": "My planning failed (invalid multi_action structure). How should I proceed?"}}
                     }, token_usage
 
-                available_actions_set = available_actions - {"ask_user", "multi_action", "task_complete", "start_visual_listener"}
+                available_actions_set_for_multi = VALID_ACTIONS - {"ask_user", "multi_action", "task_complete", "start_visual_listener"}
                 for i, sub_action in enumerate(sequence):
                     if not isinstance(sub_action, dict) or \
-                       sub_action.get("action_type") not in available_actions_set or \
+                       sub_action.get("action_type") not in available_actions_set_for_multi or \
                        not isinstance(sub_action.get("parameters"), dict):
                         logging.error(f"Invalid sub-action structure at index {i} in multi_action sequence: {sub_action}")
                         return {
@@ -1763,7 +1762,7 @@ Some hints:
                          "next_action": {"action_type": "ask_user", "parameters": {"question": "My planning failed (invalid run_python_script parameters). How should I proceed?"}}
                      }, token_usage
             
-            if action_type == "process_files_from_urls": # Added validation for process_files_from_urls
+            if action_type == "process_files_from_urls": 
                 if not all(k in params for k in ["url", "prompt"]):
                     logging.error("Invalid 'process_files_from_urls': missing 'url' or 'prompt'.")
                     return {"reasoning": "Planning failed: Invalid 'process_files_from_urls' parameters (missing 'url' or 'prompt'). Asking user for help.",
@@ -1781,7 +1780,6 @@ Some hints:
             return step_dict, token_usage
         else:
             logging.error(f"LLM response for next step has invalid structure after successful parsing. Content: {step_dict}")
-            # Detailed validation logging
             if not isinstance(step_dict, dict):
                 logging.error("Validation failed: step_dict is not a dictionary.")
             elif "next_action" not in step_dict:
@@ -1802,7 +1800,7 @@ Some hints:
                 "next_action": {"action_type": "ask_user", "parameters": {"question": "My planning failed (invalid response structure after parsing). How should I proceed?"}}
             }, token_usage
 
-    except ValueError as ve:
+    except ValueError as ve: # Catches LLM blocking due to safety, etc.
          block_reason = "Unknown"
          finish_reason_val = "Unknown"
          try:
@@ -1810,7 +1808,7 @@ Some hints:
                  block_reason = str(response.prompt_feedback.block_reason)
              if response.candidates and hasattr(response.candidates[0], 'finish_reason'):
                  finish_reason_val = str(response.candidates[0].finish_reason)
-                 if finish_reason_val == "SAFETY" and not block_reason: # Check if block_reason is already set to avoid redundancy
+                 if finish_reason_val == "SAFETY" and not block_reason: 
                      block_reason = "SAFETY (finish_reason)"
          except Exception: pass
          logging.error(f"ValueError during LLM call for next step (Block: {block_reason}, Finish: {finish_reason_val}): {ve}", exc_info=True)
@@ -1825,7 +1823,8 @@ Some hints:
             "next_action": {"action_type": "ask_user", "parameters": {"question": f"An error occurred during planning ({e}). How should I proceed?"}}
         }, {"prompt_tokens": 0, "candidates_tokens": 0, "total_tokens": 0}
 
-    return step_dict, token_usage # This line was missing in the original diff, added for completeness
+    # This line should not be reached if all paths return, but as a fallback:
+    return step_dict, token_usage
 
 def clean_llm_json_response(raw_response: str) -> str:
     """Removes markdown code fences (```json, ```) and trims whitespace from LLM JSON responses."""

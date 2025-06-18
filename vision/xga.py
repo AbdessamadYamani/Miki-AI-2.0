@@ -667,3 +667,23 @@ def visualize_ui_elements(image, elements, output_path=None):
     
     return img
 
+# Example usage
+# if __name__ == "__main__":
+#     # Example with an image path
+#     image_path = r"1.png"  # Replace with your image path
+    
+#     try:
+#         # Detect UI elements
+#         elements = detect_ui_elements_from_image(image_path)
+        
+#         # Print structured output with element type, width, height, and closest elements
+#         print(elements)
+        
+#         # For detailed JSON output:
+#         # print(elements.to_json())
+        
+#         # Visualize elements with ticket-style numbering
+#         visualize_ui_elements(image_path, elements, "ui_elements_visualization.png")
+        
+#     except Exception as e:
+#         print(f"Error: {e}")
