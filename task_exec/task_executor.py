@@ -100,6 +100,23 @@ def assess_action_outcome(
         logging.warning(f"Execution reported failure. Assessing as FAILURE. Reason: {exec_message}")
         return "FAILURE", f"Action execution failed: {exec_message}", token_usage
 
+    # Specific handling for shell and python scripts first, as their exec_success
+    # might only indicate the wrapper script's success.
+    if action_type in {"run_shell_command", "run_python_script"}:
+        error_keywords = ["npm ERR!", "pip install: command not found", "Traceback (most recent call last):", 
+                          "SyntaxError:", "FileNotFoundError:", "ModuleNotFoundError:", 
+                          "error:", "failed with exit code", "Cannot find path", "is not recognized as an internal or external command"]
+        if "[GUI Fallback Timeout]" in exec_message:
+            logging.warning(f"Shell command '{action_type}' message indicates GUI fallback timeout. Assessing as FAILURE.")
+            return "FAILURE", f"Action failed: GUI fallback timeout. Message: {exec_message}", token_usage
+        if exec_success and any(keyword.lower() in exec_message.lower() for keyword in error_keywords):
+            logging.warning(f"Shell command '{action_type}' reported success by execution (exit code 0) but message contains error keywords. Assessing as FAILURE. Message: {exec_message}")
+            return "FAILURE", f"Action failed: Error indicators in output despite reported success. Message: {exec_message}", token_usage
+        # If exec_success is true and no error keywords, then it's a success.
+        # If exec_success was false, it would have been caught by the block above.
+        logging.info(f"Action '{action_type}' reported success by execution and message seems clean. Assessing as SUCCESS.")
+        return "SUCCESS", f"Action executed successfully: {exec_message}", token_usage
+
     # Add file processing actions to non-visual actions
     non_visual_actions_or_explicit_success = {
         "wait", "get_clipboard", "set_clipboard", "save_credential", "read_file", "write_file",
@@ -107,9 +124,8 @@ def assess_action_outcome(
         "generate_large_content_with_gemini", "process_local_files", "process_files_from_urls"  # Added file processing actions
     }
     
-    if action_type in non_visual_actions_or_explicit_success or \
-    action_type in {"run_shell_command", "run_python_script"}:
-        logging.info(f"Action '{action_type}' reported success and is non-visual or has explicit success criteria. Assessing as SUCCESS.")
+    if action_type in non_visual_actions_or_explicit_success:
+        logging.info(f"Action '{action_type}' is non-visual or has explicit success criteria. Assessing as SUCCESS based on exec_success.")
         return "SUCCESS", f"Action executed successfully: {exec_message}", token_usage
 
     if screenshot_after is None:
@@ -203,7 +219,7 @@ def request_replan_from_failure(
     elif failed_action_type == "run_shell_command" or failed_action_type == "run_python_script":
         replan_guidance_list.extend([
             f"   * {failed_action_type} Failure Specifics: The assessment reasoning contains the error output.",
-            "   * **If 'ENOENT', 'cannot find path/file', 'not recognized as an internal or external command', 'Code 2' error:** Command name might be misspelled, the program might not be in the system PATH, or it needs a full path. NEW plan MUST verify command spelling, use full path if needed, OR ensure the correct `working_directory` is used if the command is relative to it. **DO NOT add `cd` to `command` string.**",
+            "   * **If 'ENOENT', 'cannot find path/file', 'not recognized as an internal or external command', 'Code 2' error:** Command name might be misspelled, the program might not be in the system PATH, or it needs a full path. The NEW plan MUST verify command spelling, use full path if needed, OR ensure the `command` string itself includes the necessary `cd /d \"path_to_directory\" && ...` to set the correct context before the main command.",
             "   * **If a chained command (using `&&` or `&`) failed:** Analyze which part of the chain failed from the error message. The NEW plan should address that specific failing part, possibly by breaking the chain into smaller, verifiable steps or using `search_web` on the specific error.",
             "   * **If 'file used by another process' error:** Previous background command (`npx create-react-app`, `npm install`, complex script) likely still running. NEW plan MUST include a longer `wait` (180-300s) *before* the failed step.",
             "   * **If a creation command (e.g., `mkdir`) failed because the item 'already exists':** This is often not a true failure if the goal was to *ensure* the item exists. The NEW plan should acknowledge this and proceed with the next logical step, assuming the item is now present. DO NOT try to create it again unless the goal is to handle a name conflict (in which case, `ask_user` might be needed).",
@@ -211,6 +227,12 @@ def request_replan_from_failure(
             "   * **If error creating/editing file content via shell (`echo`, `Set-Content`):** Unreliable. NEW plan MUST use `write_file` action instead.",
             "   * If command/script not found: Check typos or try full path.",
             "   * If syntax error: Check quoting/escaping or try alternative command/script logic.",
+            "   * **If the command was `npm install`, `pip install`, or a similar package installation/build command AND the failure reasoning indicates a timeout (`[GUI Fallback Timeout]`) or shows error messages from the command itself (check the 'Error Output' section in the reasoning):**",
+            "       *   DO NOT immediately retry the exact same installation command.",
+            "       *   Consider if a `wait` step (e.g., 60-180s) is needed if a previous step like `npx create-react-app` might not have fully completed, or if the system needs time after the command.",
+            "       *   Verify the `working_directory` is correct for the command (e.g., `npm install` should be run inside the project directory).",
+            "       *   If the error messages are specific (e.g., missing peer dependency, network error), the NEW plan could try to address that (e.g., `search_web` for the error, or `ask_user` if a dependency is ambiguous).",
+            "       *   If it was part of a chained command (e.g., `create-react-app ... && npm install`), ensure the prior parts of the chain were intended to complete successfully and analyze which part failed.",
             "   * **CRITICAL:** Ensure the generated plan is a complete sequence of steps with correct structure.",
         ])
     elif failed_action_type == "click":
@@ -265,7 +287,7 @@ def request_replan_from_failure(
         "*   `{{ \"action_type\": \"type\", \"parameters\": {{ \"text_to_type\": \"...\", \"interval_seconds\": 0.05 }} }}`",
         "*   `{{ \"action_type\": \"press_keys\", \"parameters\": {{ \"keys\": [...] }} }}`",
         "*   `{{ \"action_type\": \"move_mouse\", \"parameters\": {{ \"x\": ..., \"y\": ... }} }}`",
-        "*   `{{ \"action_type\": \"run_shell_command\", \"parameters\": {{ \"command\": \"...\", \"working_directory\": \"...\"? }} }}`",
+        "*   `{{ \"action_type\": \"run_shell_command\", \"parameters\": {{ \"command\": \"...\" }} }}`",
         "*   `{{ \"action_type\": \"run_python_script\", \"parameters\": {{ \"script_path\": \"...\", \"working_directory\": \"...\"? }} }}`",
         "*   `{{ \"action_type\": \"write_file\", \"parameters\": {{ \"file_path\": \"...\", \"content\": \"...\", \"append\": false? }} }}`",
         "*   `{{ \"action_type\": \"navigate_web\", \"parameters\": {{ \"url\": \"...\" }} }}`",
@@ -570,7 +592,6 @@ def _adapt_plan_from_past_task(
     return adapted_plan if adapted_plan else None
 
 
-
 def iterative_task_executor(
     original_instruction: str,
     agent_state: 'AgentState',
@@ -578,29 +599,25 @@ def iterative_task_executor(
     llm_model: genai.GenerativeModel,
     initial_history: Optional[List[str]] = None
 ) -> Generator[Dict[str, Any], Optional[str], List[Tuple[dict, bool, str, Optional[Dict]]]]:
-    # Check if llm_model is None and try to get a new instance
     if llm_model is None:
         llm_model = get_model()
         if llm_model is None:
             logging.error("LLM model is None and could not be initialized")
-            # Yield or raise an error to indicate failure
             yield {"type": "error", "message": "LLM model not initialized"}
-            return [] # Return empty list or handle error appropriately
+            return []
 
-    # Get critic model
     critic_model = get_critic_model()
     if critic_model is None:
         logging.error("Critic model is None and could not be initialized")
         yield {"type": "error", "message": "Critic model not initialized"}
         return []
 
-
     results = []
     max_iterations = 25
     current_iteration = agent_state.current_task.iteration_count if agent_state.current_task else 0
     task_completed = False
     current_app_base_name = "unknown"
-    current_shortcuts: Union[str, List[Dict[str, str]]] = [] # Can be string or list of dicts
+    current_shortcuts: Union[str, List[Dict[str, str]]] = []
     last_assessment_screenshot_hash: Optional[str] = None
     action_failure_counts: Dict[str, int] = agent_state.current_task.action_failure_counts if agent_state.current_task else {}
 
@@ -621,19 +638,18 @@ def iterative_task_executor(
     plan_source = "Standard Planning"
     user_plan_used = False
     chosen_high_level_plan_description: Optional[str] = None
+    action_to_execute: Optional[Dict[str, Any]] = None
     current_sub_tasks: List[str] = []
     current_sub_task_index: int = 0
     instruction_for_current_planning_cycle = original_instruction
     pending_risky_action: Optional[Dict[str, Any]] = None
-    user_response_to_ask: Optional[str] = None # Initialize user_response_to_ask
+    user_response_to_ask: Optional[str] = None
 
     logging.info(f"Starting iterative execution for: {original_instruction}")
     load_shortcuts_cache()
 
-    # --- Attempt to use similar past task execution ---
-    if not plan_to_inject: # Only if no other plan is already injected
+    if not plan_to_inject:
         logging.info(f"Checking for similar past successful tasks for: {original_instruction}")
-        # Ensure n_results is at least 1 if collection is not empty
         similar_past_tasks = retrieve_similar_task_executions_from_db(original_instruction, n_results=1) # type: ignore
         if similar_past_tasks:
             for past_task_data in similar_past_tasks:
@@ -655,8 +671,8 @@ def iterative_task_executor(
                             print(f"Current Task: '{original_instruction}'")
                             print(f"Adapted from: '{past_instruction_text}' (Similarity Distance: {similarity_distance:.4f})")
                             print(f"Adapted Actions ({len(adapted_plan)} steps):{RESET}")
-                            for i, action in enumerate(adapted_plan):
-                                print(f"  {i+1}. {action.get('action_type')}: {action.get('parameters')}")
+                            for i, action_item in enumerate(adapted_plan):
+                                print(f"  {i+1}. {action_item.get('action_type')}: {action_item.get('parameters')}")
                             print(f"{BLUE}======================================{RESET}\n")
                             logging.info(f"Injecting adapted plan with {len(plan_to_inject)} steps.")
                             break
@@ -681,7 +697,6 @@ def iterative_task_executor(
         if agent_state.current_task: agent_state.current_task.initial_planning_done = True
 
     while current_iteration < max_iterations and not task_completed:
-        action_to_execute = None # Initialize action_to_execute at the start of each iteration
 
         if current_sub_tasks and 0 <= current_sub_task_index < len(current_sub_tasks):
             instruction_for_current_planning_cycle = current_sub_tasks[current_sub_task_index]
@@ -741,44 +756,52 @@ def iterative_task_executor(
                     else:
                         log_message += " No specific action defined to re-establish this context if lost and not recently in history."
                         logging.error(log_message)
+        
+        while agent_state.task_is_paused and user_response_to_ask is None:
+            logging.debug("Generator: Task is paused. Yielding 'paused' state.")
+            yield {"type": "paused"}
+            logging.debug("Generator: Resuming from pause check.")
 
-        while agent_state.task_is_paused:
-            if pending_risky_action and user_response_to_ask is not None:
+        if user_response_to_ask is not None:
+            response_processed_this_cycle = False
+            if pending_risky_action:
                 confirmed_command_str = pending_risky_action.get("parameters", {}).get("command", "Unknown command")
                 if "yes" in user_response_to_ask.lower():
                     logging.info(f"User confirmed risky command: {confirmed_command_str}")
                     action_to_execute = pending_risky_action.copy()
-                    action_to_execute["_bypass_confirmation_"] = True
+                    action_to_execute["_confirmed_"] = True
                     if agent_state.current_task:
                         agent_state.current_task.conversation_history.append({"role": "system", "content": f"System: User confirmed execution of risky command '{confirmed_command_str}'."})
-                    pending_risky_action = None
-                    user_response_to_ask = None
                 else:
                     logging.warning(f"User denied risky command: {confirmed_command_str}")
                     results.append((pending_risky_action, False, f"User denied risky command execution: {confirmed_command_str}", None))
                     if agent_state.current_task:
                         agent_state.current_task.conversation_history.append({"role": "system", "content": f"System: User denied execution of risky command '{confirmed_command_str}'."})
-                    pending_risky_action = None
-                    user_response_to_ask = None
-                    total_consecutive_failures = 0
-                    consecutive_failures_on_current_step = 0
-                    replan_attempts_current_cycle = 0
-                    current_iteration +=1
-                    if agent_state.current_task: agent_state.current_task.iteration_count = current_iteration
-                    logging.info(f"--- Iteration {current_iteration}/{max_iterations} (User Denied Risky Command) ---")
-                    continue
-            elif pending_risky_action and user_response_to_ask is None:
-                logging.warning("Resumed from pause but pending_risky_action exists and user_response_to_ask is None. This might be an issue.")
-            logging.debug("Generator: Task is paused. Yielding 'paused' state.")
-            yield {"type": "paused"}
-            logging.debug("Generator: Resuming from pause check.")
+                    action_to_execute = None
+                    total_consecutive_failures = 0; consecutive_failures_on_current_step = 0; replan_attempts_current_cycle = 0
+                pending_risky_action = None
+                response_processed_this_cycle = True
+            
+            if not response_processed_this_cycle and agent_state.current_task:
+                current_task_instruction = user_response_to_ask
+                action_to_execute = None
+                total_consecutive_failures = 0; consecutive_failures_on_current_step = 0; replan_attempts_current_cycle = 0
+
+            user_response_to_ask = None
         
         current_iteration += 1
         if agent_state.current_task: agent_state.current_task.iteration_count = current_iteration
         logging.info(f"--- Iteration {current_iteration}/{max_iterations} (Plan Source: {plan_source}, Consecutive Failures: {total_consecutive_failures}, Replans: {replan_attempts_current_cycle}) ---")
         logging.info(f"Current planning cycle instruction: '{instruction_for_current_planning_cycle}'")
 
-        if not action_to_execute:
+        planning_reasoning = "Planning skipped due to pending credential request or injected plan." 
+        next_step_data = None
+
+        if action_to_execute:
+            logging.info(f"Proceeding with action determined from user response: {action_to_execute.get('action_type')}")
+            if not planning_reasoning or planning_reasoning == "Planning skipped due to pending credential request or injected plan.":
+                 planning_reasoning = "Executing action based on direct user confirmation/input."
+        else:
             if plan_to_inject is not None:
                 logging.info(f"Injecting new plan (reason: {plan_injection_reason}, {len(plan_to_inject)} steps).")
                 if not plan_to_inject:
@@ -828,19 +851,18 @@ def iterative_task_executor(
         except Exception as app_detect_err:
             logging.error(f"Error during application detection/shortcut handling: {app_detect_err}", exc_info=True)
             current_app_base_name = "unknown"; current_shortcuts = ""
-
-        planning_screenshot = capture_full_screen()
-        screenshot_before_action_hash = _hash_pil_image(planning_screenshot)
-
-        if last_assessment_screenshot_hash and screenshot_before_action_hash and screenshot_before_action_hash != last_assessment_screenshot_hash:
-            logging.info("Detected screen change since last assessment.")
-            if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "system", "content": "System Observation: Screen content changed since last action."})
-
-        # action_to_execute = None # This was moved to the top of the loop
-        planning_reasoning = "Planning skipped due to pending credential request or injected plan."
-        next_step_data = None
-
+        
         if not action_to_execute:
+            planning_screenshot = capture_full_screen()
+            screenshot_before_action_hash = _hash_pil_image(planning_screenshot)
+
+            if last_assessment_screenshot_hash and screenshot_before_action_hash and screenshot_before_action_hash != last_assessment_screenshot_hash:
+                logging.info("Detected screen change since last assessment.")
+                if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "system", "content": "System Observation: Screen content changed since last action."})
+
+            planning_reasoning = "Planning skipped due to pending credential request or injected plan."
+            next_step_data = None
+
             if chosen_high_level_plan_description:
                 logging.info(f"Using chosen high-level plan description for detailed planning: {chosen_high_level_plan_description[:200]}...")
                 instruction_for_current_planning_cycle = chosen_high_level_plan_description
@@ -887,6 +909,11 @@ def iterative_task_executor(
                 action_to_execute = next_step_data["next_action"]
                 planning_reasoning = next_step_data.get("reasoning", "N/A")
 
+        if not action_to_execute:
+            logging.error("No action determined for this iteration. This could be due to planning failure or a denied risky command where no alternative was planned.")
+            results.append((({'action_type': 'STOP', 'parameters': {'reason': 'no_action_available'}}, False, "No action available to execute.", None)))
+            break
+
         action_type = action_to_execute.get("action_type") # type: ignore
         params = action_to_execute.get("parameters", {}) # type: ignore
         logging.info(f"Proposed Action: {action_type}. Reasoning: {planning_reasoning}")
@@ -904,19 +931,19 @@ def iterative_task_executor(
             action_to_execute = None
             continue
         
-        if not action_to_execute.get("_bypass_confirmation_"): # type: ignore
+        if next_step_data and isinstance(next_step_data, dict) and not action_to_execute.get("_confirmed_"):
             if next_step_data and isinstance(next_step_data, dict):
                 thought_content_json_str = json.dumps(next_step_data)
                 agent_state.add_thought(thought_content_json_str, type="planning_json")
         elif not next_step_data :
-            agent_state.add_thought(f"Iteration {current_iteration}: Plan was injected. Action: {action_type}, Params: {params}. Original Injection Reason: {plan_injection_reason}", type="planning_info")
+            agent_state.add_thought(f"Iteration {current_iteration}: Action: {action_type}, Params: {params}. Reason: {planning_reasoning}", type="planning_info")
 
         critique_passed = True
         critique_feedback = "Critique skipped for credential value request or injected plan."
         if not (pending_credential_request and credential_consent_choice in ['onetime', 'remember']) and not plan_injection_reason:
-            critique_screenshot = planning_screenshot
+            critique_screenshot = planning_screenshot if 'planning_screenshot' in locals() else capture_full_screen()
             string_history_for_critique = [f"{msg['role']}: {msg['content']}" for msg in (agent_state.current_task.conversation_history if agent_state.current_task else [])]
-            if not action_to_execute.get("_bypass_confirmation_"): # type: ignore
+            if not action_to_execute.get("_confirmed_"):
                 logging.info(f"About to call critique_action with critic_model: {critic_model}")
                 critique_passed, critique_feedback, critique_tokens = critique_action(
                     instruction_for_current_planning_cycle, string_history_for_critique, action_to_execute, critic_model, critique_screenshot # type: ignore
@@ -930,6 +957,7 @@ def iterative_task_executor(
                     replan_attempts_current_cycle = 0
                     if pending_credential_request and not credential_consent_choice:
                         pending_credential_request = None
+                    action_to_execute = None
                     continue
 
         is_legitimate_overall_completion_check_for_action = False
@@ -949,12 +977,12 @@ def iterative_task_executor(
         elif isinstance(exec_result, tuple) and len(exec_result) == 2: 
             exec_success, exec_message = exec_result # type: ignore
             special_directive = None
-
+        
         if special_directive and isinstance(special_directive, dict):
             directive_type = special_directive.get("type")
-            if exec_success is True and exec_message.startswith("Confirmation required for risky command.") and directive_type == "ask_user":
+            if directive_type == "ask_user" and exec_message.startswith("Confirmation required for risky command."):
                 question_text = special_directive.get('question', "No question provided for risky command.")
-                logging.info(f"Execution yielded for risky command confirmation: {question_text}")
+                logging.info(f"Risky command needs confirmation: {question_text}")
                 pending_risky_action = action_to_execute.copy() # type: ignore
                 results.append(((action_to_execute, True, f"Confirmation required: {question_text}", special_directive))) # type: ignore
                 yield_result = {"type": "ask_user", "question": question_text}
@@ -962,10 +990,11 @@ def iterative_task_executor(
                 if user_response_to_ask is None:
                     logging.warning("User cancelled during risky command confirmation.")
                     results[-1] = (action_to_execute, False, "User cancelled risky command confirmation.", None) # type: ignore
-                    pending_risky_action = None; break
+                    pending_risky_action = None; task_completed = True; break
                 if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "user", "content": user_response_to_ask})
+                action_to_execute = None
                 continue
-
+            
             if isinstance(special_directive, dict) and "token_usage" in special_directive:
                 action_tokens = special_directive.get("token_usage")
                 if agent_state.current_task and isinstance(action_tokens, dict): agent_state.current_task._accumulate_tokens(action_tokens)
@@ -978,10 +1007,8 @@ def iterative_task_executor(
                 if user_response_to_ask is None:
                     logging.warning("User cancelled during ask_user.")
                     results[-1] = (action_to_execute, False, "User cancelled during ask_user.", None) # type: ignore
-                    break
+                    task_completed = True; break
                 if agent_state.current_task: agent_state.current_task.conversation_history.append({"role": "user", "content": user_response_to_ask})
-                total_consecutive_failures = 0; consecutive_failures_on_current_step = 0; replan_attempts_current_cycle = 0
-                current_task_instruction = user_response_to_ask
                 action_to_execute = None
                 continue
             elif directive_type == "inform_user":
@@ -989,18 +1016,19 @@ def iterative_task_executor(
                 agent_state.task_is_paused = True
                 if agent_state.current_task: agent_state.current_task.status = "paused"
                 yield {"type": "inform_user", "message": message_to_display, "youtube_references": special_directive.get("youtube_references", []), "image_data": special_directive.get("image_data")}
-                total_consecutive_failures = 0; consecutive_failures_on_current_step = 0; replan_attempts_current_cycle = 0
                 action_to_execute = None
                 continue
             elif directive_type == "inject_plan":
                 plan_to_inject = special_directive.get("plan", [])
                 plan_injection_reason = special_directive.get("reason", "Unknown directive")
                 total_consecutive_failures = 0; consecutive_failures_on_current_step = 0; replan_attempts_current_cycle = 0
-
+                action_to_execute = None
+                continue
+        
         string_history_for_assessment = [f"{msg['role']}: {msg['content']}" for msg in (agent_state.current_task.conversation_history if agent_state.current_task else [])]
         assessment_status, assessment_reasoning, assessment_tokens = assess_action_outcome( # type: ignore
             instruction_for_current_planning_cycle, action_to_execute, exec_success, exec_message, # type: ignore
-            capture_full_screen(), llm_model, screenshot_before_hash=screenshot_before_action_hash
+            capture_full_screen(), llm_model, screenshot_before_hash=screenshot_before_action_hash if 'screenshot_before_action_hash' in locals() else None
         )
         if agent_state.current_task: agent_state.current_task._accumulate_tokens(assessment_tokens)
         final_message = f"{exec_message} | Assessment: {assessment_status} - {assessment_reasoning}"
@@ -1008,18 +1036,18 @@ def iterative_task_executor(
         final_success = (assessment_status == "SUCCESS")
         results.append(((action_to_execute, final_success, final_message, special_directive))) # type: ignore
         logging.info(f"Assessment Result: {assessment_status} - {assessment_reasoning}")
-        if agent_state.current_task: agent_state.current_task.agent_thoughts.append({"timestamp": datetime.now().isoformat(), "content": f"Step {current_iteration} Action: {action_type} {params}\nOutcome: {assessment_status} - {assessment_reasoning}", "type": "step_outcome"}) # type: ignore
+        if agent_state.current_task: agent_state.current_task.agent_thoughts.append({"timestamp": datetime.now().isoformat(), "content": f"Step {current_iteration} Action: {action_type} {params}\nOutcome: {assessment_status} - {assessment_reasoning}", "type": "step_outcome"})
 
-        if assessment_status == "SUCCESS":
+        if final_success:
             total_consecutive_failures = 0
-            if action_type: action_failure_counts[action_type] = 0 # type: ignore
+            if action_type: action_failure_counts[action_type] = 0
             consecutive_failures_on_current_step = 0
             replan_attempts_current_cycle = 0
             if plan_injection_reason and not plan_to_inject:
                 logging.info(f"Successfully completed injected plan (Reason: {plan_injection_reason}).")
                 plan_injection_reason = None
             
-            if action_type == "task_complete" and not is_legitimate_overall_completion_check_for_action: # type: ignore
+            if action_type == "task_complete" and not is_legitimate_overall_completion_check_for_action:
                 logging.info(f"Intermediate sub-task {current_sub_task_index + 1} ('{current_sub_tasks[current_sub_task_index]}') successfully completed via 'task_complete' action.")
             
             if current_sub_tasks and 0 <= current_sub_task_index < len(current_sub_tasks):
@@ -1041,10 +1069,12 @@ def iterative_task_executor(
                         task_completed = True
             
             if task_completed:
-                if agent_state.current_task and (not results or results[-1][0].get("action_type") != "task_complete"): # type: ignore
+                if agent_state.current_task and (not results or results[-1][0].get("action_type") != "task_complete"):
                      agent_state.current_task.conversation_history.append({"role": "system", "content": "Overall task completed."})
                 logging.info(f"Overall task '{original_instruction}' completed.")
                 break
+            
+            action_to_execute = None
             continue
 
         elif assessment_status == "RETRY_POSSIBLE":
@@ -1053,26 +1083,45 @@ def iterative_task_executor(
                 logging.warning(f"Assessment RETRY_POSSIBLE. Retrying step (Attempt {consecutive_failures_on_current_step + 1}/{MAX_RETRIES_PER_STEP + 1}). Reason: {assessment_reasoning}")
                 results[-1] = (action_to_execute, False, f"{exec_message} | Assessment: RETRY_POSSIBLE - {assessment_reasoning} (Retry {consecutive_failures_on_current_step})", special_directive) # type: ignore
                 time.sleep(1.0)
-                current_iteration -=1
+                current_iteration -=1 
                 continue
             else:
-                logging.error(f"Max retries ({MAX_RETRIES_PER_STEP}) for current step reached after RETRY_POSSIBLE. Treating as FAILURE.")
+                logging.error(f"Max retries ({MAX_RETRIES_PER_STEP}) for current step reached after RETRY_POSSIBLE. Treating as full FAILURE.")
                 assessment_status = "FAILURE"
-                total_consecutive_failures +=1
 
         if assessment_status == "FAILURE":
             logging.error(f"Assessment FAILURE for step. Reason: {assessment_reasoning}")
             total_consecutive_failures += 1
+            action_failure_counts[action_type] = action_failure_counts.get(action_type, 0) + 1 # type: ignore
             consecutive_failures_on_current_step = 0
             is_planning_failure = "Planning failed:" in assessment_reasoning
             if is_planning_failure:
                 pass
-            elif replan_attempts_current_cycle < MAX_REPLAN_ATTEMPTS:
-                pass
             
             if total_consecutive_failures >= MAX_CONSECUTIVE_FAILURES_BEFORE_ASK:
                 pass
-            else:
+            
+            if replan_attempts_current_cycle < MAX_REPLAN_ATTEMPTS and not is_planning_failure:
+                logging.info(f"Attempting replan ({replan_attempts_current_cycle + 1}/{MAX_REPLAN_ATTEMPTS}) due to failure.")
+                replan_data, replan_tokens = request_replan_from_failure(
+                    instruction_for_current_planning_cycle, results, action_to_execute, # type: ignore
+                    assessment_reasoning, capture_full_screen(), llm_model
+                )
+                if agent_state.current_task: agent_state.current_task._accumulate_tokens(replan_tokens)
+                replan_attempts_current_cycle += 1
+
+                if replan_data and "plan" in replan_data and isinstance(replan_data["plan"], list) and replan_data["plan"]:
+                    plan_to_inject = replan_data["plan"]
+                    plan_injection_reason = f"Replanned after failure: {replan_data.get('reasoning', 'No replan reasoning.')}"
+                    agent_state.add_thought(f"Injecting replan: {plan_injection_reason}", type="replan")
+                    action_to_execute = None
+                    total_consecutive_failures = 0
+                    continue
+                else:
+                    logging.error("Replanning failed to produce a valid plan.")
+            
+            action_to_execute = None
+            if not is_planning_failure:
                 logging.warning("Failure encountered. Proceeding to next iteration for standard planning or further failure handling.")
                 continue
         else:
@@ -1080,6 +1129,7 @@ def iterative_task_executor(
                 logging.info("All defined sub-tasks processed or unexpected assessment on last one.")
                 task_completed = True
                 break
+            action_to_execute = None
             logging.error(f"Assessment returned unexpected status '{assessment_status}'. Stopping. Reason: {assessment_reasoning}")
             break
 
@@ -1121,10 +1171,9 @@ def iterative_task_executor(
         agent_state.current_task.end_time = datetime.now()
         agent_state.is_task_running = False
         logging.info(f"Finished iterative execution. Total iterations: {current_iteration}")
-        logging.info(f"Total LLM tokens for this task (from TaskSession): {agent_state.current_task.total_tokens}")
+        logging.info(f"Total LLM tokens for this task (from TaskSession): {agent_state.current_task.total_tokens if agent_state.current_task else 'N/A'}")
 
-    return results # type: ignore
-
+    return results
 
 
 def process_next_step(
@@ -1316,7 +1365,37 @@ ELSE (if not a complex project initiation, or if a path has been chosen and impl
     Proceed with the standard planning logic below (Informational Queries, Task Completion, etc.).
 --- END META-PLANNING FOR COMPLEX PROJECTS ---
 
+--- COMPLEX, CREATIVE, OR ANALYTICAL TASKS ---
+IF the LATEST user instruction is a complex, creative, or analytical task (for example: "analyze a Spotify playlist and create a new one with the same vibe and number of songs", "summarize a YouTube video and generate a blog post from it", "extract structured data from a PDF and visualize it", or any task that could be solved in multiple ways, or that requires reasoning, analysis, or creativity):
+
+1.  **List Possible Approaches:**
+    *   List 2-4 distinct approaches to accomplish the task. For example, for a Spotify playlist analysis:
+        - Using the Spotify API directly (programmatic, requires credentials)
+        - Using UI automation (controlling the web or desktop app)
+        - Using LLM analysis (copying playlist data and analyzing it with the LLM)
+        - Using external tools or web services
+    *   For each approach, briefly explain the method, pros, and cons (e.g., "API: Most robust, but requires user to provide credentials. UI automation: No credentials needed, but more brittle. LLM: Fast, but may be less accurate.").
+
+2.  **Ask for User Preference:**
+    *   After listing the approaches, your `next_action` MUST be `ask_user` with a question like: "Which approach would you like to use? (e.g., API, UI automation, LLM, or other). If you are not sure, I can recommend one."
+    *   Do NOT proceed with any approach until the user has selected or confirmed a method.
+
+3.  **Proceed Only After User Input:**
+    *   Once the user responds, analyze their choice and proceed to plan the next step using the selected approach.
+    *   If the user is unsure, you may recommend the most robust or user-friendly method and ask for confirmation before proceeding.
+
+**STOP HERE for this turn after asking the user. Do not proceed to the standard planning logic until the user has chosen an approach.**
+
+--- END COMPLEX, CREATIVE, OR ANALYTICAL TASKS SECTION ---
+
 --- STANDARD PLANNING LOGIC ---
+
+**Error Handling and Self-Fixing:**
+If any action (such as a shell command, script, or file operation) fails, you will see the full error message in the recent history (look for 'System Observation:' lines with error details).
+- Analyze the error, reason about the likely cause, and plan a fix or workaround using the available tools and your knowledge.
+- Try to fix the problem up to 2 times. If the error persists after 2 attempts, ask the user whether to ignore the error and continue, or to try fixing it 2 more times (e.g., "The error still persists after 2 fix attempts. Do you want to ignore it and continue, or try fixing it 2 more times? Type 'ignore' to continue, or 'retry' to try again.").
+- Do not give up on the first failure—always attempt to resolve the issue using your knowledge and available actions before asking the user.
+
 1.  **Information Gathering (If Needed):**
     *   **Consider the project's nature:** Is it a common type of project with well-known architectures (e.g., a standard web app)? Or is it niche, requiring research?
     *   **Check Learnings/Reinforcements:** Do any past learnings from the DB suggest specific architectures, tools, or user preferences for similar complex tasks?
@@ -1438,7 +1517,9 @@ Your `reasoning` for this `INFORM_USER` action should state that you are present
 *   `{{ "action_type": "type", "parameters": {{ "text_to_type": "Hello World!", "interval_seconds": 0.05 }} }}`
 *   `{{ "action_type": "press_keys", "parameters": {{ "keys": ["ctrl", "s"] }} }}`
 *   `{{ "action_type": "move_mouse", "parameters": {{ "x": 100, "y": 200, "duration_seconds": 0.25 }} }}`
-*   `{{ "action_type": "run_shell_command", "parameters": {{ "command": "mkdir my_folder", "working_directory": "C:\\Users\\User\\Desktop" }} }}`
+*   `{{ "action_type": "run_shell_command", "parameters": {{ "command": "cd /d C:\\\\Users\\\\User\\\\Desktop ; mkdir my_folder" }} }}`
+*   `{{ "action_type": "run_shell_command", "parameters": {{ "command": "cd /d C:\\\\Users\\\\user\\\\Desktop\\\\Miki_test_AI\\\\Miki-AI-main\\\\Miki-AI-main\\\\uploads && npm install" }} }}`
+    - On Windows, to run a command in a specific directory, you must combine the directory change and the command in a single line using `&&`. For example: `cd /d C:\\path\\to\\dir && npm install`. Do NOT generate a plan that only changes the directory; always include the intended command after `&&`.
 *   `{{ "action_type": "run_python_script", "parameters": {{ "script_path": "scripts/process_data.py", "working_directory": "OPTIONAL_PATH" }} }}`
 *   `{{ "action_type": "write_file", "parameters": {{ "file_path": "output.txt", "content": "Data processed." }} }}`
 *   `{{ "action_type": "navigate_web", "parameters": {{ "url": "https://google.com" }} }}`
@@ -1501,7 +1582,7 @@ Your `reasoning` for this `INFORM_USER` action should state that you are present
         *   'open notepad and type hello' (could be a `multi_action` with `run_shell_command`, `wait`, `focus_window`, `type`)
         *   'what is the weather in London?' (could be a single `search_web` followed by `INFORM_USER` in the next turn)
         *   'save the current document' (could be a single `press_keys` like `ctrl+s` if shortcuts are known)
-        *   'create a folder named temp on the desktop' (could be a single `run_shell_command` like `mkdir C:\\Users\\User\\Desktop\\temp`)
+        *   'create a folder named temp on the desktop' (could be a single `run_shell_command` like `cd /d C:\\\\Users\\\\User\\\\Desktop ; mkdir temp`)
     *   Do not overcomplicate simple requests. If a task can be done in 1-3 steps, plan accordingly.
 
 *   **Visual Actions for GUI:** Use visual interaction tools (`focus_window`, `click`, `type`) when dealing with graphical user interfaces that lack direct command-line or shortcut control.
@@ -1574,6 +1655,14 @@ Some hints:
 - with the tools you have you can literally do any task, you have only to make smart plans and use them wisely
 - Sometime you can use actions to do other purposes , for exemple you can use the click action to toggle the screenshot so you can see, so it s not nessesary use click only to see
 - Shortcuts can be used also in websites if you want to search for shortcuts list of a website you can rely on the tool navigate_web
+
+**CRITICAL RULE FOR SHELL COMMANDS:**
+- Do **NOT** use `run_shell_command` to open a terminal window (e.g., `cmd.exe`, `start cmd`, `start cmd.exe`).
+- Instead, always run the intended command directly. For example, to run `npm install` in a directory, use `cd /d C:\\path\\to\\dir && npm install` as the command.
+- Never propose a plan that only opens a terminal window; always include the full command to be executed.
+
+**CRITICAL RULE FOR ACTION REPETITION:**
+- Do NOT repeat a `run_shell_command` (or any action) that has already succeeded in the current task history, unless the user explicitly asks to repeat it or there is a clear reason to do so (e.g., the environment has changed).
 """
 
     content = [{"text": prompt}]

@@ -88,8 +88,8 @@ Available actions:
     - Parameters: file_path, content, append (optional)
 13. read_file: Read content from a file
     - Parameters: file_path
-14. run_shell_command: Execute a shell command
-    - Parameters: command, working_directory (optional)
+14. run_shell_command: Execute a shell command. If a specific directory is needed, include it in the command itself (e.g., "cd /d C:\\path\\to\\dir && your_command").
+    - Parameters: command
 15. run_python_script: Run a Python script
     - Parameters: script_path, working_directory (optional)
 16. search_youtube: Search YouTube videos and analyze transcripts

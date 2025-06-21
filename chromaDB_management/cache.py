@@ -27,6 +27,9 @@ def get_active_window_name() -> str:
             window_title = win32gui.GetWindowText(window_handle)
 
             _, pid = win32process.GetWindowThreadProcessId(window_handle)
+            if not isinstance(pid, int) or pid <= 0:
+                logging.error(f"Invalid PID detected for active window: {pid}")
+                return "unknown_app"
             process = psutil.Process(pid)
             app_name = process.name()
 

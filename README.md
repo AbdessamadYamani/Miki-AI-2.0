@@ -124,60 +124,45 @@ npm install
 cd ..
 ```
 
-## 💻 Usage Examples
-
-### Basic Automation Tasks
-```python
-# Start the agent
+6. **Run the Application**
+```bash
 python app_flask.py
-
-# Example commands:
-"Open Chrome and search for Python tutorials"
-"Take a screenshot and analyze the current window"
-"Create a new folder named 'Projects' on my desktop"
-"Move the mouse to the search button and click it"
 ```
 
-### Custom Task Structures
-```python
-# Define custom task approaches:
-"Create a task structure: whenever I ask you to create a report, always use Microsoft Word"
-"Update my report task to include a cover page and table of contents"
-"Show me all my custom task structures"
-"Delete the old presentation task structure"
-```
+7. **Set Your API Key**
+- The first time you run the application, it will open in your web browser at `http://localhost:5001`.
+- You will be prompted to enter your Google Gemini API key. Paste your key into the input field to activate the agent's capabilities.
+- **You must set the API key before you can run any tasks.**
 
-### Advanced Project Management
-```python
-# Complex project automation:
-"Create a new web development project and show me the sequence diagram"
-"Plan a data analysis workflow and visualize the process"
-"Set up a backup system with visual workflow representation"
-```
+## 💻 Usage
 
-### Web & Content Integration
-```python
-# Web and YouTube integration:
-"Search YouTube for 'machine learning basics' and get the transcript"
-"Find the latest news about AI and create a summary report"
-"Download content from this webpage and organize it"
-```
+Once the agent is running and your API key is configured, you can start automating tasks by typing instructions into the chat interface.
 
-### AI-Powered Image Tasks
-```python
-# Image generation examples:
-"Generate a logo for my project and use it in the presentation"
-"Create diagrams that explain this concept visually"
-"Generate placeholder images for my website mockup"
-```
+## ⚠️ Performance Considerations & Limitations
 
-### Intelligent Tool Selection
-```python
-# Multi-approach examples:
-"I need to edit a video - show me all possible approaches"
-"Help me create a database - what are the best tools for this?"
-"Analyze this dataset and recommend the best analysis method"
-```
+### Vision-Based Automation Performance
+- **OCR Processing Time**: The agent uses Tesseract OCR to analyze screen content and locate UI elements. This process can take 2-5 seconds per visual action (click, type, etc.) as it captures screenshots, processes them with OCR, and analyzes the results.
+- **Visual Action Overhead**: Each mouse click or keyboard interaction requires screen capture and analysis, which adds latency compared to direct shell commands.
+- **Performance Optimization**: The agent prioritizes non-visual actions (shell commands, shortcuts) over visual ones when possible to minimize delays.
+
+### Token Usage Considerations
+- **Variable Token Consumption**: Token usage varies significantly based on task complexity and the amount of visual analysis required. Simple shell commands use minimal tokens, while complex visual tasks with multiple screenshots can consume hundreds of tokens per action.
+- **Planning Overhead**: The agent's planning system uses tokens for each decision-making step, with complex tasks requiring more planning iterations.
+- **Cost Management**: For cost-conscious users, consider using the task structure system (see below) to reduce planning overhead for repetitive tasks.
+
+### Task Structure System - Performance Optimization
+The project includes a powerful task structure system that helps mitigate performance issues:
+
+- **Pre-Defined Workflows**: Users can create custom task structures that define specific approaches for repetitive tasks (e.g., "always use Word for reports").
+- **Reduced Planning Overhead**: When a similar task is requested, the agent can follow the pre-defined structure instead of planning from scratch, significantly reducing token usage and execution time.
+- **Consistent Behavior**: Ensures the agent follows user-preferred approaches rather than potentially choosing inefficient methods.
+- **Adaptive Learning**: The system can adapt past successful task executions to new similar tasks, further reducing planning time.
+
+### Recommended Usage Patterns
+- **Use Task Structures**: Create task structures for frequently performed tasks to reduce planning overhead.
+- **Prefer Shell Commands**: When possible, use shell commands instead of GUI automation for better performance.
+- **Batch Operations**: Combine multiple related actions into single commands when feasible.
+- **Monitor Token Usage**: The interface displays token usage to help you understand cost implications.
 
 ## 🔧 Configuration
 
@@ -263,15 +248,8 @@ LOG_LEVEL=DEBUG
 - `delete_task_structure()`: Remove obsolete task templates
 - `list_task_structures()`: View all custom task configurations
 
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit changes (`git commit -m 'Add amazing feature'`)
-4. Push to branch (`git push origin feature/amazing-feature`)
-5. Create Pull Request
-
 ## 📝 License
+
 This project is licensed under the MIT License - see LICENSE file for details.
 
 ## 🚀 Future Enhancements

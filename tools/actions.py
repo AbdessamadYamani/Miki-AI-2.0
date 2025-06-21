@@ -13,7 +13,8 @@ import pyautogui
 import pyperclip
 from vision.vis import focus_window_by_title,get_screen_description_from_gemini
 from tools.web_search_tool import search_web_for_info,navigate_web
-from tools.youtube_tool import process_and_store_youtube_videos, search_youtube_transcripts
+import uuid # Added for unique sentinel in GUI execution
+from tools.youtube_tool import process_and_store_youtube_videos, search_youtube_transcripts # type: ignore
 from utils.file_util import _execute_read_file
 import subprocess
 from tools.image_generating import generate_or_edit_image
@@ -21,7 +22,9 @@ import mimetypes
 import pathlib
 import httpx
 import tempfile
+import uuid # Added for unique sentinel
 from tools.files_upload import process_files_from_urls,process_local_files
+import pygetwindow as gw
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -125,19 +128,56 @@ def _execute_write_file(file_path: str, content: str, append: bool = False) -> T
         logging.error(f"Unexpected error {action_desc} file '{file_path}': {e}", exc_info=True)
         return False, f"Unexpected error {action_desc} file '{file_path}': {e}"
 
+def execute_cmd_via_run(cmd):
+    """
+    Execute a command through Windows Run dialog (Win+R) -> cmd -> command
+    Returns success message or error details
+    
+    Args:
+        cmd (str): The command to execute in the command prompt
+        
+    Returns:
+        str: "cmd executed successfully" or the error message
+    """
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        
+        if result.returncode == 0:
+            pyautogui.hotkey('win', 'r')
+            time.sleep(0.5)
+            pyautogui.write('cmd')
+            time.sleep(0.2)
+            
+            pyautogui.press('enter')
+            
+            pyautogui.write(cmd)
+            time.sleep(0.2)
+            pyautogui.press('enter')
+            
+            time.sleep(1)
+            
+            pyautogui.hotkey('alt', 'f4')
+            
+            return "cmd executed successfully"
+        else:
+            error_output = result.stderr.strip() if result.stderr.strip() else result.stdout.strip()
+            return error_output if error_output else f"Command failed with return code {result.returncode}"
+            
+    except subprocess.TimeoutExpired:
+        return "Command timed out after 30 seconds"
+    except Exception as e:
+        return f"Error executing command: {str(e)}"
 
 def execute_shell_command(
     command: str, 
     working_directory: Optional[str] = None, 
     allow_confirmation_prompt: bool = True,
     bypass_confirmation_flag: bool = False) -> Union[Tuple[int, str], Tuple[int, str, Dict[str, Any]]]:
-    import shlex # Import shlex at the top of the function
-    log_suffix = f" in '{working_directory}'" if working_directory else ""
-    logging.info(f"Attempting to execute shell command: {command}{log_suffix}")
-
     effective_cwd = None
     if working_directory:
         try:
+            if not isinstance(working_directory, str):
+                raise TypeError(f"working_directory must be a string, got {type(working_directory)}")
             expanded_wd = os.path.expandvars(working_directory)
             abs_wd = os.path.abspath(expanded_wd)
             if os.path.isdir(abs_wd):
@@ -145,21 +185,30 @@ def execute_shell_command(
                 logging.info(f"Effective working directory set to: {effective_cwd}")
             else:
                 logging.error(f"Specified working directory does not exist or is not a directory: {abs_wd}")
-                return -1, f"Invalid working directory: {working_directory} (Resolved to: {abs_wd})"
+                return False, f"Invalid working directory: {working_directory} (Resolved to: {abs_wd})", None
         except Exception as wd_err:
             logging.error(f"Error processing working directory '{working_directory}': {wd_err}")
-            return -1, f"Error with working directory: {wd_err}"
+            return False, f"Error with working directory: {wd_err}", None
+    
+    log_suffix_msg = f" in working directory '{effective_cwd}'" if effective_cwd else ""
 
     risky_keywords = [
-        "rm ", "del ", "format ", "shutdown ", "reboot ", "sudo ",
+        "rm ", "del ", "format ", "shutdown ", "reboot ", "sudo ", "runas ",
         "remove-item ", "mkfs", ":(){:|:&};:",
-        "npm install", "pip install", "conda install", # Added common package managers
-        "npx create-react-app", "git clone", # Added common project initializers
+        "npm install", "pip install", "conda install",
+        "npx create-react-app", "git clone",
     ]
     command_lower = command.lower().strip()
     is_risky = any(keyword in command_lower for keyword in risky_keywords)
 
-    if not bypass_confirmation_flag: # Only check for risky if not already bypassed
+    cmd_open_variants = [
+        "start cmd", "start cmd.exe", "cmd", "cmd.exe"
+    ]
+    if command_lower in cmd_open_variants or command_lower.strip() in cmd_open_variants:
+        logging.error(f"Blocked attempt to open a visible cmd window: '{command}'. Use run_shell_command to execute commands directly.")
+        return False, "Opening a visible cmd window is not supported. Use run_shell_command to execute commands directly instead of typing into a GUI terminal.", None
+
+    if not bypass_confirmation_flag:
         if is_risky and CONFIRM_RISKY_COMMANDS:
             if allow_confirmation_prompt:
                 logging.warning(f"[WARNING] Command '{command}' identified as potentially risky.")
@@ -168,287 +217,38 @@ def execute_shell_command(
                     f"{f' in directory: {effective_cwd}' if effective_cwd else ''}\n\n"
                     "Allow execution? (Type 'yes' to allow, anything else to deny)"
                 )
-                # Return code -2 signifies a need for user confirmation
                 return -2, "Confirmation required for risky command.", {"type": "ask_user", "question": confirmation_question}
-            else: # Risky command in a non-interactive context (e.g., multi_action)
+            else:
                 logging.warning(f"Risky command '{command}' encountered within a non-interactive context (allow_confirmation_prompt=False). Action failed.")
-                return -1, f"Risky command '{command}' cannot be auto-confirmed in this context. Action failed."
+                return -1, f"Risky command '{command}' cannot be auto-confirmed in this context. Action failed.", None
 
-    # --- Determine command type and prepare Python command if necessary ---
-    is_python_command_execution = False
-    final_command_for_python = command # Default to original command
-
-    if command_lower.startswith(("python ", "python.exe ", "py ")):
-        is_python_command_execution = True
-        final_command_for_python = command # Already prefixed
-    else:
-        try: # shlex is now imported at the function top
-            command_parts_for_py_check = shlex.split(command)
-            if command_parts_for_py_check and command_parts_for_py_check[0].lower().endswith(".py"):
-                # Further check if the .py file actually exists could be added here for more robustness
-                # For example: if os.path.isfile(os.path.expandvars(command_parts_for_py_check[0])):
-                is_python_command_execution = True
-                python_exe_path = f'"{sys.executable}"' if " " in sys.executable else sys.executable
-                # Reconstruct the command string with the Python executable prepended
-                # The original 'command' string already has arguments and any necessary quoting from the LLM/user
-                final_command_for_python = f"{python_exe_path} {command}"
-                logging.info(f"Identified '{command_parts_for_py_check[0]}' as Python script. Prepared command: {final_command_for_python}")
-        except Exception as e_shlex_prepare:
-            logging.warning(f"Error using shlex to parse command for .py check: {e_shlex_prepare}. Original command: {command}")
-
-    background_check_commands = [
-        "npx", "npm", "yarn", "pip", "conda", "git", "docker",
-        "make", "mvn", "gradle", "dotnet build", # Common build tools
-    ]
-    gui_launchers = [ # Common GUI application launchers
-        "code.exe", "code", "notepad.exe", "notepad", "cmd.exe", "cmd",
-        "powershell.exe", "powershell", "explorer.exe", "explorer",
-        "start " # "start" is a Windows shell command to launch apps
-    ]
-    run_gui_launcher = False
-    run_in_background_check = False
-    command_start_lower = command_lower.split()[0] if command_lower else ""
-    if not is_python_command_execution: # Only check these if not already identified as a Python script execution
-        for gui_cmd in gui_launchers:
-            # Check if command starts with a known GUI launcher name or if it's 'start' followed by arguments
-            # Add cmd and powershell to the list of GUI launchers
-            # so they are not treated as blocking commands
-            if (command_lower.startswith(gui_cmd) or \
-                os.path.basename(command_start_lower) == gui_cmd.strip() or \
-                (gui_cmd == "start " and command_lower.startswith("start ") and len(command.split()) > 1)):
-                run_gui_launcher = True
-                logging.info(f"Identified command '{command}' as GUI launcher. Will use Popen with DEVNULL.")
-                break
-        if not run_gui_launcher: # If not a GUI launcher, check if it's a background-able command
-            if any(command_start_lower == bg_cmd for bg_cmd in background_check_commands):
-                run_in_background_check = True
-                logging.info(f"Identified command '{command}' for background check. Will use Popen with PIPE.")
-    # --- Command Execution Logic ---
-    process = None
     try:
-        if is_python_command_execution:
-            if sys.platform == "win32":
-                logging.info(f"Using Popen (CREATE_NEW_CONSOLE) for Python command on Windows: {final_command_for_python}{log_suffix}")
-                try:
-                    process = subprocess.Popen(final_command_for_python, shell=True,
-                                               cwd=effective_cwd,
-                                               env=os.environ.copy(),
-                                               creationflags=subprocess.CREATE_NEW_CONSOLE)
-                    time.sleep(0.5) # Give the new console a moment
-                    logging.info(f"Launched Python script in new console window (PID: {process.pid}). User interaction may be required there.")
-                    process = None # Detach from the process
-                    return 0, f"Launched Python script '{command}' in a new visible terminal window."
-                except Exception as e:
-                    logging.error(f"Error launching Python script '{final_command_for_python}' in new console: {e}", exc_info=True)
-                    return -1, f"Error launching Python script '{command}' in new console: {e}"
-            else: # Non-Windows Python script execution
-                # For non-Windows, if a Python script is meant to be a long-running server,
-                # this Popen().wait() will block. This is standard for scripts expected to terminate.
-                # If non-blocking is needed for Python scripts on Linux/macOS, further logic changes would be required.
-                logging.info(f"Using Popen (blocking wait) for Python command on {sys.platform}: {final_command_for_python}{log_suffix}")
-                try: # shlex is now imported at the function top
-                    cmd_list_for_popen = shlex.split(final_command_for_python)
-                    process = subprocess.Popen(cmd_list_for_popen, shell=False, # shell=False is safer with list
-                                               cwd=effective_cwd,
-                                               env=os.environ.copy())
-                    exit_code = process.wait() # Wait for the script to complete
-                    logging.info(f"Interactive Python command '{final_command_for_python}' finished with exit code: {exit_code}")
-                    output_message = f"Python script '{command}' finished with exit code {exit_code}."
-                    if exit_code != 0:
-                        output_message += " Check agent terminal for errors."
-                    return exit_code, output_message
-                except KeyboardInterrupt: # Handle Ctrl+C if the agent is run interactively
-                    logging.warning(f"User interrupted interactive Python command: {final_command_for_python}")
-                    if process and process.poll() is None: process.terminate()
-                    return -1, "User interrupted Python script execution."
-                except Exception as wait_err:
-                    logging.error(f"Error running/waiting for interactive Python command '{final_command_for_python}': {wait_err}")
-                    if process and process.poll() is None: process.kill()
-                    return -1, f"Error during Python script execution: {wait_err}"
-        elif run_gui_launcher:
-            logging.info(f"Using Popen (DEVNULL) to launch GUI: {command}{log_suffix}")
-            process = subprocess.Popen(command, shell=True, # shell=True is common for 'start' or direct exe paths
-                                       stdout=subprocess.DEVNULL,
-                                       stderr=subprocess.DEVNULL,
-                                       stdin=subprocess.DEVNULL, # Prevent hanging on input
-                                       cwd=effective_cwd)
-            time.sleep(1.0) # Give GUI app time to launch
-            poll_result = process.poll() # Check if it exited immediately
-            if poll_result is not None and poll_result != 0:
-                logging.warning(f"GUI command '{command}' exited immediately with code {poll_result}. It might have failed to launch properly.")
-            # For GUI launchers, we often don't wait for them to close.
-            return 0, f"Launched GUI command: {command}" # Assume success if Popen doesn't immediately error
-        elif run_in_background_check:
-            logging.info(f"Using Popen (PIPE) for background check: {command}{log_suffix}")
-            process = subprocess.Popen(command, shell=True,
-                                       stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE,
-                                       stdin=subprocess.DEVNULL,
-                                       text=True, encoding='utf-8', errors='replace',
-                                       env=os.environ.copy(), # Pass environment
-                                       cwd=effective_cwd)
-            short_timeout_for_quick_exit = 5.0 # Seconds to wait for quick commands
-            try:
-                # Try to get output if it finishes quickly
-                stdout_data, stderr_data = process.communicate(timeout=short_timeout_for_quick_exit)
-                exit_code = process.returncode
-                stdout_str = stdout_data.strip() if stdout_data else ""
-                stderr_str = stderr_data.strip() if stderr_data else ""
-                output = (stdout_str + ("\n" + stderr_str if stdout_str and stderr_str else stderr_str)).strip()
-                logging.info(f"Command '{command}' completed quickly with exit code: {exit_code}")
-                if exit_code == 0:
-                    return 0, f"Command OK (completed quickly). Output:\n{output}" if output else "Command OK (completed quickly). (No output)"
-                else:
-                    logging.error(f"Command failed quickly (Code: {exit_code}). Output:\n{output}" if output else f"Command failed quickly (Code: {exit_code}). (No output)")
-                    return exit_code, f"Command failed quickly (Code: {exit_code}). Output:\n{output}" if output else f"Command failed quickly (Code: {exit_code}). (No output)"
-            except subprocess.TimeoutExpired:
-                # Command is still running, assume it's a long-running background task
-                logging.info(f"Command '{command}' did not exit within {short_timeout_for_quick_exit}s. Assuming long-running background task (PID: {process.pid}).")
-                process_pid = process.pid
-                process = None # Detach from the process, let it run
-                return 0, f"Started background command (still running, PID: {process_pid}): {command}"
-
-        else: # General blocking commands
-            logging.info(f"Using subprocess.run (blocking) for command: {command}{log_suffix}")
-            blocking_timeout = 180 # Timeout for blocking commands
-            # Determine if shell=True is needed (e.g., for pipes, wildcards on Windows)
-            use_shell_for_run = sys.platform == "win32" or any(c in command for c in ["|", ">", "<", "*", "?", ";", "&&", "||"])
-            command_to_run_list_or_str = command
-            if not use_shell_for_run:
-                try: # shlex is now imported at the function top
-                    command_to_run_list_or_str = shlex.split(command)
-                    logging.debug(f"Executing command with shell=False: {command_to_run_list_or_str}")
-                except ValueError as shlex_err_run: # If shlex fails to parse
-                    logging.warning(f"shlex failed to parse command ('{shlex_err_run}'), falling back to shell=True for subprocess.run.")
-                    use_shell_for_run = True
-                    command_to_run_list_or_str = command
-
-            result = subprocess.run(
-                command_to_run_list_or_str,
-                shell=use_shell_for_run,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-                check=False, # We check returncode manually
-                timeout=blocking_timeout,
-                env=os.environ.copy(), # Pass environment
-                cwd=effective_cwd
-            )
-            stdout_str = result.stdout.strip() if result.stdout else ""
-            stderr_str = result.stderr.strip() if result.stderr else ""
-
-            if stderr_str: # Prioritize stderr for the main part of the message if it exists
-                output = f"Error Output:\n{stderr_str}" + (f"\nStandard Output:\n{stdout_str}" if stdout_str else "")
-            else:
-                output = f"Standard Output:\n{stdout_str}" if stdout_str else "(No output)"
-
-            logging.info(f"Blocking command exit code: {result.returncode}")
-            if output and output != "(No output)": logging.debug(f"Blocking command output:\n{output}")
-            else: logging.debug("Blocking command produced no output.")
-
-            if result.returncode == 0:
-                return 0, f"Command OK. {output}"
-            else:
-                logging.error(f"Blocking command '{command}' failed (Code: {result.returncode}). {output}")
-                # If initial attempt failed on Windows, try with PowerShell
-                if sys.platform == "win32":
-                    logging.info(f"Initial attempt for '{command}' failed. Retrying with PowerShell...")
-                    ps_command_str = f'& {{{command}}}' # PowerShell command block
-                    try:
-                        ps_run_result = subprocess.run(
-                            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_command_str],
-                            capture_output=True, text=True, encoding="utf-8", errors="replace",
-                            check=False, timeout=blocking_timeout, env=os.environ.copy(), cwd=effective_cwd,
-                            shell=False # Calling powershell.exe directly
-                        )
-                        ps_stdout = ps_run_result.stdout.strip() if ps_run_result.stdout else ""
-                        ps_stderr = ps_run_result.stderr.strip() if ps_run_result.stderr else ""
-                        ps_combined_output = ""
-                        if ps_stderr and ps_run_result.returncode != 0:
-                            ps_combined_output = f"PowerShell Error Output:\n{ps_stderr}" + (f"\nPowerShell Standard Output:\n{ps_stdout}" if ps_stdout else "")
-                        else:
-                            ps_combined_output = f"PowerShell Standard Output:\n{ps_stdout}" if ps_stdout else "(No PowerShell output)"
-                            if ps_stderr: ps_combined_output += f"\nPowerShell Error Output (but command may have succeeded):\n{ps_stderr}"
-
-                        if ps_run_result.returncode == 0:
-                            logging.info(f"PowerShell retry for '{command}' succeeded.")
-                            return 0, f"Command OK (via PowerShell retry). {ps_combined_output}"
-                        else:
-                            logging.error(f"PowerShell retry for '{command}' failed (Code: {ps_run_result.returncode}).\n{ps_combined_output}")
-                            return result.returncode, f"Command failed (Original Code: {result.returncode}). PowerShell retry also failed (Code: {ps_run_result.returncode}).\nOriginal Output:\n{output}\nPowerShell Output:\n{ps_combined_output}"
-                    except Exception as ps_e:
-                        logging.error(f"Exception during PowerShell retry for '{command}': {ps_e}", exc_info=True)
-                        # Fallthrough to return original error if PowerShell retry itself had an exception
-                return result.returncode, f"Command '{command}' failed (Code: {result.returncode}). {output}" # Original failure if not Windows or PS retry fails
-
-    except FileNotFoundError:
-        cmd_name_fnf = command.split()[0]
-        logging.error(f"Command not found or not executable: '{cmd_name_fnf}' in command '{command}'{log_suffix}")
-        if sys.platform == "win32":
-            logging.info(f"Command '{command}' not found. Retrying with PowerShell...")
-            ps_command_str_fnf = f'& {{{command}}}'
-            blocking_timeout_fnf = 180 # Define timeout for this specific retry
-            try:
-                ps_run_result_fnf = subprocess.run(
-                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_command_str_fnf],
-                    capture_output=True, text=True, encoding="utf-8", errors="replace",
-                    check=False, timeout=blocking_timeout_fnf, env=os.environ.copy(), cwd=effective_cwd,
-                    shell=False
-                )
-                ps_stdout_fnf = ps_run_result_fnf.stdout.strip() if ps_run_result_fnf.stdout else ""
-                ps_stderr_fnf = ps_run_result_fnf.stderr.strip() if ps_run_result_fnf.stderr else ""
-                ps_combined_output_fnf = ""
-                if ps_stderr_fnf and ps_run_result_fnf.returncode != 0:
-                     ps_combined_output_fnf = f"PowerShell Error Output:\n{ps_stderr_fnf}" + (f"\nPowerShell Standard Output:\n{ps_stdout_fnf}" if ps_stdout_fnf else "")
-                else:
-                     ps_combined_output_fnf = f"PowerShell Standard Output:\n{ps_stdout_fnf}" if ps_stdout_fnf else "(No PowerShell output)"
-                     if ps_stderr_fnf: ps_combined_output_fnf += f"\nPowerShell Error Output (but command may have succeeded):\n{ps_stderr_fnf}"
-
-                if ps_run_result_fnf.returncode == 0:
-                    logging.info(f"PowerShell retry for '{command}' (after FNF) succeeded.")
-                    return 0, f"Command OK (via PowerShell retry after FNF). {ps_combined_output_fnf}"
-                else:
-                    logging.error(f"PowerShell retry for '{command}' (after FNF) also failed (Code: {ps_run_result_fnf.returncode}).\n{ps_combined_output_fnf}")
-                    return -1, f"Command not found/executable: {cmd_name_fnf}. PowerShell retry also failed (Code: {ps_run_result_fnf.returncode}).\nPowerShell Output:\n{ps_combined_output_fnf}"
-            except FileNotFoundError: # powershell.exe not found
-                logging.error("PowerShell executable not found. Cannot retry with PowerShell.")
-                return -1, f"Command not found/executable: {cmd_name_fnf}. (PowerShell not found for retry)"
-            except subprocess.TimeoutExpired:
-                logging.error(f"PowerShell retry for '{command}' (after FNF) timed out.")
-                return -1, f"Command not found/executable: {cmd_name_fnf}. (PowerShell retry timed out)"
-            except Exception as ps_e_fnf:
-                logging.error(f"Exception during PowerShell retry for '{command}' (after FNF): {ps_e_fnf}", exc_info=True)
-                return -1, f"Command not found/executable: {cmd_name_fnf}. (PowerShell retry exception: {ps_e_fnf})"
-        else: # Not Windows
-            return -1, f"Command not found/executable: {cmd_name_fnf}. Ensure it's in PATH or use full path."
-    except PermissionError:
-        logging.error(f"Permission denied executing: {command}{log_suffix}")
-        return -1, f"Permission denied executing command: {command}"
+        logging.info(f"Attempting direct execution: subprocess.run for command: {command}")
+        result = subprocess.run(
+            command,
+            cwd=effective_cwd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False
+        )
+        if result.returncode == 0:
+            logging.info(f"Direct execution successful. Output: {result.stdout[:200] if result.stdout else ''}...")
+            return True, result.stdout.strip() if result.stdout else "Command executed successfully with no output.", None
+        else:
+            error_message = f"Command failed with code {result.returncode}: {result.stderr.strip() if result.stderr else result.stdout.strip() if result.stdout else 'No error output.'}"
+            logging.error(f"Direct execution failed: {error_message}")
+            return False, error_message, None
     except subprocess.TimeoutExpired:
-        # This case should ideally be caught by specific timeouts above, but as a fallback for .run
-        logging.error(f"Blocking command timed out: {command}{log_suffix}")
-        return -1, f"Command timed out."
+        logging.error("Direct command execution timed out after 5 minutes.")
+        return False, "Command timed out after 5 minutes.", None
+    except FileNotFoundError:
+        logging.error(f"Direct command execution failed: Executable for '{command.split()[0]}' not found.")
+        return False, f"Executable for '{command.split()[0]}' not found.", None
     except Exception as e:
-        logging.error(f"Error executing shell command '{command}'{log_suffix}: {e}", exc_info=True)
-        return -1, f"Error executing command: {e}"
-    finally:
-        # Ensure Popen processes that were not detached are cleaned up if they are still running
-        if process and process.poll() is None: # If process exists and is still running
-            try:
-                logging.warning(f"Attempting to terminate lingering Popen process (PID: {process.pid}) for command '{command}'")
-                process.terminate()
-                try:
-                    process.wait(timeout=2) # Give it a moment to terminate
-                except subprocess.TimeoutExpired:
-                    logging.warning(f"Process {process.pid} did not terminate gracefully, killing.")
-                    process.kill() # Force kill if terminate fails
-                # Close stdio pipes if they were opened (for Popen with PIPE)
-                if hasattr(process, 'stdout') and process.stdout: process.stdout.close()
-                if hasattr(process, 'stderr') and process.stderr: process.stderr.close()
-            except Exception as e_cleanup:
-                logging.warning(f"Error during Popen cleanup for '{command}': {e_cleanup}")
-
-
-
+        logging.error(f"Direct command execution failed with unexpected error: {e}.", exc_info=True)
+        return False, f"Unexpected error during command execution: {e}", None
 
 def execute_action(action: dict, agent: 'UIAgent') -> Union[Tuple[bool, str], Tuple[bool, str, Dict[str, Any]]]:
     """Execute an action and return the result."""
@@ -701,18 +501,23 @@ def execute_action(action: dict, agent: 'UIAgent') -> Union[Tuple[bool, str], Tu
             elif action_type == "run_shell_command":
                 command = parameters.get("command")
                 working_directory = parameters.get("working_directory")
+                print(command)
                 if not command or not isinstance(command, str):
                     return False, "Action 'run_shell_command' failed: Missing/invalid 'command'.", None
+                
                 allow_confirm = parameters.get("_is_top_level_action_", True)
-                bypass_confirm = action.get("_bypass_confirmation_", False) # Get the bypass flag
-                shell_result = execute_shell_command(
-                    command, working_directory=working_directory, 
-                    allow_confirmation_prompt=allow_confirm,
-                    bypass_confirmation_flag=bypass_confirm)
-                if isinstance(shell_result, tuple) and len(shell_result) == 3 and shell_result[0] == -2: # type: ignore
-                    return shell_result # type: ignore
-                exit_code, output_msg = shell_result # type: ignore
-                return (exit_code == 0), output_msg, None
+                bypass_confirm = action.get("_confirmed_", False)
+                
+                shell_result = execute_shell_command(command, working_directory=working_directory,
+                                                       allow_confirmation_prompt=allow_confirm,
+                                                       bypass_confirmation_flag=bypass_confirm)
+                
+                # Check if command executed successfully
+                if shell_result[0]:
+                    return True, shell_result[1], None
+                else:
+                    # Command failed, return error message
+                    return False, shell_result[1], None
 
             elif action_type == "run_python_script":
                 script_path = parameters.get("script_path")
@@ -722,12 +527,15 @@ def execute_action(action: dict, agent: 'UIAgent') -> Union[Tuple[bool, str], Tu
                 python_executable = "python" if sys.platform != "win32" else "py"
                 command_to_run = f'{python_executable} "{script_path}"'
                 logging.info(f"Constructed Python command: {command_to_run}")
-
-                py_exec_result = execute_shell_command(command_to_run, working_directory=working_directory)
+                allow_confirm = parameters.get("_is_top_level_action_", True) # Python scripts can also be risky
+                bypass_confirm = action.get("_confirmed_", False)
+                py_exec_result = execute_shell_command(command_to_run, working_directory=working_directory,
+                                                       allow_confirmation_prompt=allow_confirm,
+                                                       bypass_confirmation_flag=bypass_confirm)
                 if isinstance(py_exec_result, tuple) and len(py_exec_result) == 3 and py_exec_result[0] == -2: # type: ignore
                     return py_exec_result # type: ignore
                 exit_code, output_msg = py_exec_result # type: ignore
-                return (exit_code == 0), output_msg, None
+                return (exit_code == 0), output_msg, None # type: ignore
 
             elif action_type == "navigate_web":
                 url = parameters.get("url")
@@ -1264,3 +1072,36 @@ def assess_action_outcome(
     except Exception as e:
         logging.error(f"Error during assessment LLM call or parsing: {e}", exc_info=True)
         return "FAILURE", f"Assessment failed due to an unexpected error: {e}. Assuming failure.", token_usage
+
+def run_shell_diagnostics():
+    """
+    Runs a series of diagnostic shell commands to help debug why shell commands like pip/npm/node may fail.
+    Prints the results to the terminal/log.
+    """
+    import platform
+    print("\n--- Shell Diagnostics ---")
+    print(f"Platform: {platform.platform()}")
+    print(f"Python Executable: {sys.executable}")
+    print(f"Current Working Directory: {os.getcwd()}")
+    print(f"PATH: {os.environ.get('PATH')}")
+    
+    commands = [
+        ("Echo Test", "echo hello_from_agent"),
+        ("Where pip", "where pip" if sys.platform == "win32" else "which pip"),
+        ("Where python", "where python" if sys.platform == "win32" else "which python"),
+        ("Where npm", "where npm" if sys.platform == "win32" else "which npm"),
+        ("Where node", "where node" if sys.platform == "win32" else "which node"),
+        ("Pip Version", "pip --version"),
+        ("Npm Version", "npm --version"),
+        ("Node Version", "node --version"),
+    ]
+    for desc, cmd in commands:
+        print(f"\n[{desc}] $ {cmd}")
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=20)
+            print(f"Exit Code: {result.returncode}")
+            print(f"STDOUT: {result.stdout.strip()}")
+            print(f"STDERR: {result.stderr.strip()}")
+        except Exception as e:
+            print(f"Error running '{cmd}': {e}")
+    print("--- End Diagnostics ---\n")
