@@ -248,10 +248,6 @@ LOG_LEVEL=DEBUG
 - `delete_task_structure()`: Remove obsolete task templates
 - `list_task_structures()`: View all custom task configurations
 
-## 📝 License
-
-This project is licensed under the MIT License - see LICENSE file for details.
-
 ## 🚀 Future Enhancements
 
 ### Planned Features
