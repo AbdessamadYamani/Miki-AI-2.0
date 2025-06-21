@@ -151,7 +151,7 @@ Once the agent is running and your API key is configured, you can start automati
 - **Cost Management**: For cost-conscious users, consider using the task structure system (see below) to reduce planning overhead for repetitive tasks.
 
 ### Task Structure System - Performance Optimization
-The project includes a powerful task structure system that helps mitigate performance issues:
+The project includes task structure system that helps mitigate performance issues:
 
 - **Pre-Defined Workflows**: Users can create custom task structures that define specific approaches for repetitive tasks (e.g., "always use Word for reports").
 - **Reduced Planning Overhead**: When a similar task is requested, the agent can follow the pre-defined structure instead of planning from scratch, significantly reducing token usage and execution time.
@@ -165,15 +165,6 @@ The project includes a powerful task structure system that helps mitigate perfor
 - **Monitor Token Usage**: The interface displays token usage to help you understand cost implications.
 
 ## 🔧 Configuration
-
-### Environment Variables
-Create a `.env` file in the project root:
-```env
-DEBUG_MODE=false
-LOG_LEVEL=INFO
-ENABLE_WEB_SEARCH=true
-ENABLE_IMAGE_GENERATION=true
-```
 
 ### Custom Settings
 - Modify `config.py` for advanced settings
@@ -210,23 +201,16 @@ ENABLE_IMAGE_GENERATION=true
    - Check if Node.js is properly installed
 
 2. **API Key Issues**
-   - Verify Google API key in `.env`
    - Check API key permissions for web search and image generation
 
 3. **Permission Errors**
-   - Run as administrator for full system access
    - Check file/folder permissions for automation tasks
 
 4. **Vision/Screen Capture Issues**
    - Ensure the application has screen capture permissions
    - Check display scaling settings
 
-### Debug Mode
-Enable debug mode in `.env`:
-```env
-DEBUG_MODE=true
-LOG_LEVEL=DEBUG
-```
+
 
 ## 📚 API Documentation
 
@@ -265,7 +249,7 @@ LOG_LEVEL=DEBUG
 
 ## 🙏 Acknowledgments
 
-Special thanks to the open-source community and the developers of the tools and libraries that make this project possible.
+Special thanks to the developers of the tools and libraries that make this project possible.
 
 ---
 
@@ -273,4 +257,3 @@ Special thanks to the open-source community and the developers of the tools and 
 **Version**: Latest  
 **Status**: Active Development
 
-**Need Help?** Open an issue or check the documentation for more details!
